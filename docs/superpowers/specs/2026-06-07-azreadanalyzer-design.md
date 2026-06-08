@@ -45,6 +45,20 @@ azReadAnalyzer is a macOS desktop app for English speaking practice. The user ca
     └─────────┘                └─────────────────┘
 ```
 
+```mermaid
+graph TD
+    FE["React / TypeScript + Tailwind\nZustand store"]
+    IPC["Tauri IPC"]
+    RS["Rust Backend\nclipboard · screen cap · audio · whisper STT"]
+    LLM["Local LLM\nOpenAI-compatible endpoint"]
+    SID["Python Sidecars\nocr_service :8124 · tts_service :8123"]
+
+    FE <-->|commands & events| IPC
+    IPC <--> RS
+    RS -->|fluency feedback| LLM
+    RS -->|OCR / TTS| SID
+```
+
 ### Sidecars
 
 | Sidecar | Language | Purpose |
@@ -66,6 +80,17 @@ OpenAI-compatible endpoint (same env vars as azVoiceAssist: `OMLX_BASE_URL`, `OM
 4. ANALYZE   Stop recording → Whisper transcribes → LLM compares to original
 5. FEEDBACK  Diff view (original vs transcription) + fluency score (0–100) + LLM comments
 6. REPEAT    Re-record same text OR capture new text
+```
+
+```mermaid
+flowchart LR
+    A["📷 Capture\nScreenshot / Clipboard"] --> B["📝 Text Panel\neditable"]
+    B --> C["🔊 Listen\nTTS Playback"]
+    C --> D["⏺ Record\nMic Input"]
+    D --> E["🔍 Analyze\nWhisper + LLM"]
+    E --> F["📊 Feedback\nScore + Diff + Comments"]
+    F -->|"Re-record\nsame text"| D
+    F -->|"New text"| A
 ```
 
 Each session is one **practice round**. The user can re-record the same text as many times as they want before moving to new content.
@@ -153,6 +178,25 @@ User clicks "Screenshot"
   → Tauri restores window
 ```
 
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant FE as Frontend
+    participant RS as Rust
+    participant OCR as OCR Sidecar
+
+    U->>FE: Click "Screenshot"
+    FE->>RS: capture_screenshot
+    RS->>RS: Hide window
+    RS->>RS: screencapture -i → /tmp/az_capture.png
+    U->>RS: Draw screen region
+    RS->>OCR: POST /ocr {image_path}
+    OCR-->>RS: {text}
+    RS-->>FE: emit text-captured {text}
+    RS->>RS: Restore window
+    FE->>FE: Populate TextInputPanel
+```
+
 ### Record → Feedback
 ```
 User clicks "Record"
@@ -163,6 +207,32 @@ User clicks "Stop"
   → Rust runs Whisper STT → transcription string
   → Rust calls local LLM: {original_text, transcription} → {score, diff, comments}
   → Tauri emits feedback-ready event → FeedbackPanel renders
+```
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant FE as Frontend
+    participant RS as Rust
+    participant WH as Whisper STT
+    participant LM as Local LLM
+
+    U->>FE: Click "Record"
+    FE->>RS: start_recording
+    RS->>RS: cpal mic → WAV buffer
+    loop every ~100ms
+        RS-->>FE: audio-level {level}
+        FE->>FE: Animate waveform + timer
+    end
+    U->>FE: Click "Stop"
+    FE->>RS: stop_recording
+    RS->>RS: Save /tmp/az_recording.wav
+    RS->>WH: transcribe(wav)
+    WH-->>RS: transcription string
+    RS->>LM: {original_text, transcription}
+    LM-->>RS: {score, diff, comments}
+    RS-->>FE: emit feedback-ready {score, diff, comments, transcription}
+    FE->>FE: Render FeedbackPanel
 ```
 
 ---
