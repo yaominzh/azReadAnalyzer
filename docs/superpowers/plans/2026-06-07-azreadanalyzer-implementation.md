@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a macOS Tauri 2 desktop app for English speaking practice — capture text via screenshot OCR or clipboard, TTS playback, self-recording, Whisper STT + LLM fluency feedback.
+**Goal:** Build a macOS Tauri 2 desktop app for English speaking practice — capture text via screenshot OCR or clipboard, TTS playback, self-recording, Whisper STT, and feedback on **content accuracy** (Rust-computed diff) + **fluency/pacing** (Rust-computed metrics from word timestamps) + **LLM coaching** (score + comments).
 
-**Architecture:** Tauri 2 (Rust backend + React/TypeScript frontend). Two Python sidecars: `ocr_service` (Vision OCR on screenshots) and `tts_service` (Qwen3-TTS, reused from azVoiceAssist). Rust handles clipboard, audio recording, and Whisper STT. Local LLM provides fluency score and coaching comments.
+**Architecture:** Tauri 2 (Rust backend + React/TypeScript frontend). Two Python sidecars: `ocr_service` (Vision OCR on screenshots) and `tts_service` (Qwen3-TTS, reused from azVoiceAssist — synthesizes WAV only; playback is client-side via HTML5 Audio). Rust handles clipboard, audio recording, Whisper STT (with word timestamps), the deterministic content diff, and pacing-metric computation. The local LLM receives the diff + pacing metrics and returns a score + coaching comments only — it does NOT compute the diff. See the design spec's "Feedback Methodology & Research Basis" section for why v1 scopes to content accuracy + fluency/pacing (not phoneme-level pronunciation).
 
 **Tech Stack:** Tauri 2.10.3 · React 19 · TypeScript 6 · Tailwind CSS v4 · Zustand 5 · Vite 8 · transcribe-rs 0.3.11 · cpal 0.16 · hound 3 · arboard 3 · similar 2 · reqwest 0.12 · Python FastAPI (sidecars)
 
@@ -39,9 +39,10 @@ azReadAnalyzer/
 │   ├── capture.rs                ← screenshot + OCR sidecar call
 │   ├── clipboard.rs              ← arboard clipboard read
 │   ├── audio.rs                  ← cpal mic recording + audio-level events
-│   ├── stt.rs                    ← Whisper STT via transcribe-rs
-│   ├── diff.rs                   ← word-level diff via similar crate
-│   └── llm.rs                    ← LLM HTTP client for fluency feedback
+│   ├── stt.rs                    ← Whisper STT via transcribe-rs (text + word timestamps)
+│   ├── diff.rs                   ← deterministic word-level diff via similar crate
+│   ├── fluency.rs                ← pacing metrics from word timestamps
+│   └── llm.rs                    ← LLM HTTP client (score + comments from diff + pacing)
 ├── src-tauri/
 │   ├── Cargo.toml
 │   ├── build.rs
@@ -385,6 +386,7 @@ pub mod clipboard;
 pub mod audio;
 pub mod stt;
 pub mod diff;
+pub mod fluency;
 pub mod llm;
 mod commands;
 mod events;
@@ -445,11 +447,23 @@ pub struct LlmComment {
     pub text: String,
 }
 
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PacingMetrics {
+    pub words_per_minute: f32,
+    pub articulation_rate: f32,
+    pub pause_count: u32,
+    pub total_pause_ms: u32,
+    pub pause_ratio: f32,
+    pub long_hesitations: u32,
+}
+
 #[derive(Serialize, Clone)]
 pub struct FeedbackReadyPayload {
     pub score: u32,
     pub transcription: String,
     pub diff: Vec<DiffToken>,
+    pub pacing: PacingMetrics,
     pub comments: Vec<LlmComment>,
 }
 
@@ -532,20 +546,29 @@ pub async fn stop_recording(
 
     crate::events::emit_recording_state(&app, "analyzing");
 
-    let transcription = {
+    // Whisper returns text + word timestamps (see stt.rs / Task 14)
+    let result = {
         let mut eng = state.stt_engine.lock().map_err(|e| e.to_string())?;
         let engine = eng.as_mut().ok_or("Whisper not loaded")?;
         engine.transcribe(&wav_path)?
     };
 
-    let diff = crate::diff::word_diff(&original_text, &transcription);
-    let (score, comments) = crate::llm::get_feedback(&original_text, &transcription)
-        .await
-        .unwrap_or((0, vec![]));
+    let diff = crate::diff::word_diff(&original_text, &result.text);
+    let pacing = crate::fluency::compute_pacing(&result.words);
+    let (score, comments) =
+        crate::llm::get_feedback(&original_text, &result.text, &diff, &pacing)
+            .await
+            .unwrap_or((0, vec![]));
 
     crate::events::emit_feedback_ready(
         &app,
-        crate::events::FeedbackReadyPayload { score, transcription, diff, comments },
+        crate::events::FeedbackReadyPayload {
+            score,
+            transcription: result.text,
+            diff,
+            pacing,
+            comments,
+        },
     );
     crate::events::emit_recording_state(&app, "idle");
     Ok(())
@@ -580,9 +603,23 @@ impl Recorder {
 Create `src-tauri/src/stt.rs`:
 ```rust
 use std::path::Path;
+
+/// One transcribed word with its timing, used for pacing analysis.
+pub struct WordTimestamp {
+    pub word: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Full STT result: text plus per-word timestamps.
+pub struct Transcription {
+    pub text: String,
+    pub words: Vec<WordTimestamp>,
+}
+
 pub struct WhisperEngine;
 impl WhisperEngine {
-    pub fn transcribe(&mut self, _path: &Path) -> Result<String, String> { todo!() }
+    pub fn transcribe(&mut self, _path: &Path) -> Result<Transcription, String> { todo!() }
 }
 ```
 
@@ -592,10 +629,22 @@ use crate::events::DiffToken;
 pub fn word_diff(_original: &str, _transcription: &str) -> Vec<DiffToken> { vec![] }
 ```
 
+Create `src-tauri/src/fluency.rs`:
+```rust
+use crate::events::PacingMetrics;
+use crate::stt::WordTimestamp;
+pub fn compute_pacing(_words: &[WordTimestamp]) -> PacingMetrics { PacingMetrics::default() }
+```
+
 Create `src-tauri/src/llm.rs`:
 ```rust
-use crate::events::LlmComment;
-pub async fn get_feedback(_original: &str, _transcription: &str) -> Result<(u32, Vec<LlmComment>), String> {
+use crate::events::{DiffToken, LlmComment, PacingMetrics};
+pub async fn get_feedback(
+    _original: &str,
+    _transcription: &str,
+    _diff: &[DiffToken],
+    _pacing: &PacingMetrics,
+) -> Result<(u32, Vec<LlmComment>), String> {
     Ok((0, vec![]))
 }
 ```
@@ -782,6 +831,11 @@ Create `src/store/__tests__/useAppStore.test.ts`:
 import { describe, it, expect, beforeEach } from "vitest";
 import { useAppStore } from "../useAppStore";
 
+const ZERO_PACING = {
+  wordsPerMinute: 0, articulationRate: 0, pauseCount: 0,
+  totalPauseMs: 0, pauseRatio: 0, longHesitations: 0,
+};
+
 describe("useAppStore", () => {
   beforeEach(() => useAppStore.setState(useAppStore.getInitialState()));
 
@@ -795,13 +849,13 @@ describe("useAppStore", () => {
   });
 
   it("setFeedback stores feedback result", () => {
-    const fb = { score: 85, transcription: "hello", diff: [], comments: [] };
+    const fb = { score: 85, transcription: "hello", diff: [], pacing: ZERO_PACING, comments: [] };
     useAppStore.getState().setFeedback(fb);
     expect(useAppStore.getState().feedback?.score).toBe(85);
   });
 
   it("clearFeedback resets feedback to null", () => {
-    useAppStore.getState().setFeedback({ score: 85, transcription: "x", diff: [], comments: [] });
+    useAppStore.getState().setFeedback({ score: 85, transcription: "x", diff: [], pacing: ZERO_PACING, comments: [] });
     useAppStore.getState().clearFeedback();
     expect(useAppStore.getState().feedback).toBeNull();
   });
@@ -837,11 +891,23 @@ export interface LlmComment {
   text: string;
 }
 
+// Pacing metrics computed in Rust (fluency.rs) from word timestamps.
+// Field names are camelCase to match Rust's #[serde(rename_all = "camelCase")].
+export interface PacingMetrics {
+  wordsPerMinute: number;
+  articulationRate: number;
+  pauseCount: number;
+  totalPauseMs: number;
+  pauseRatio: number;
+  longHesitations: number;
+}
+
 // Full feedback result
 export interface FeedbackResult {
   score: number;
   transcription: string;
   diff: DiffToken[];
+  pacing: PacingMetrics;
   comments: LlmComment[];
 }
 
@@ -862,6 +928,7 @@ export interface FeedbackReadyPayload {
   score: number;
   transcription: string;
   diff: DiffToken[];
+  pacing: PacingMetrics;
   comments: LlmComment[];
 }
 
@@ -1060,9 +1127,17 @@ export function useMockEvents() {
             { text: " you can develop", type: "missed" },
             { text: ".", type: "correct" },
           ],
+          pacing: {
+            wordsPerMinute: 142,
+            articulationRate: 168,
+            pauseCount: 6,
+            totalPauseMs: 4200,
+            pauseRatio: 0.21,
+            longHesitations: 2,
+          },
           comments: [
-            { icon: "🔤", text: '"clearly" — you said "clear". Practice adverb forms: speak clearly, act boldly.' },
-            { icon: "⏭️", text: 'You dropped the final clause "you can develop". Slow down at sentence endings.' },
+            { icon: "🐢", text: 'Your pace (142 wpm) is on the slow side for read-aloud — aim for 150–170.' },
+            { icon: "⏸️", text: '2 long hesitations and a 21% pause ratio. Try reading a full clause without stopping.' },
             { icon: "✅", text: 'Good rhythm on the opening clause — natural stress and pacing.' },
           ],
         });
@@ -2212,11 +2287,45 @@ curl -L -o ~/.azreadanalyzer/models/ggml-base.en.bin \
 
 Expected: ~141MB download. Verify: `ls -lh ~/.azreadanalyzer/models/ggml-base.en.bin`
 
+- [ ] **Step 2b: Verify transcribe-rs timestamp support (BLOCKING — do before fluency.rs in Task 15B)**
+
+The design spec flags this as a known risk: `fluency.rs` needs per-segment (or per-word) timestamps, and it's unverified that `transcribe-rs` 0.3.11 surfaces them. Inspect the crate's API before relying on it:
+
+```bash
+# Find the installed crate source and grep for timestamp accessors
+find ~/.cargo/registry/src -type d -name "transcribe-rs-*" 2>/dev/null
+grep -rn "segment_t0\|segment_t1\|token_timestamps\|full_get_segment_t\|start\|end" \
+  "$(find ~/.cargo/registry/src -type d -name 'transcribe-rs-*' | head -1)/src" | head -40
+```
+
+Expected outcomes and how to proceed:
+- **Segment timestamps exposed** (e.g. `full_get_segment_t0/t1`, in centiseconds): use them — this is the common case and is sufficient. Whisper breaks segments at natural pauses, so inter-segment gaps are a good pause proxy. Implement Step 3 as written below.
+- **Only text exposed (no timestamps):** Step 3's segment-timestamp calls won't compile. Fallback: derive a coarse pacing signal from total audio duration (WAV length via `hound`) ÷ word count for WPM, and record `pauseCount = 0` (document the limitation). Note this in `fluency.rs` and the FeedbackPanel ("pause metrics unavailable").
+- **Word/token timestamps exposed:** even better — populate `WordTimestamp` directly instead of distributing within segments.
+
+Record what you found in a one-line comment at the top of `stt.rs` so the next task knows which path was taken.
+
 - [ ] **Step 3: Implement `src-tauri/src/stt.rs`**
 
+The `transcribe` method returns a `Transcription { text, words }`. Words are built from per-segment timestamps: each segment's words are distributed evenly across the segment's `[t0, t1]` span, and the natural silence *between* segments is preserved as a gap between the last word of one segment and the first word of the next — which is exactly what `fluency.rs` reads as a pause. (If Step 2b found only text, use the fallback described there instead.)
+
 ```rust
+// stt.rs — transcribe-rs timestamp granularity used: SEGMENT-level (see Task 14 Step 2b).
 use std::path::{Path, PathBuf};
 use transcribe_rs::{WhisperContext, WhisperContextParams, WhisperParams, WhisperSamplingStrategy};
+
+/// One transcribed word with its timing, used for pacing analysis (fluency.rs).
+pub struct WordTimestamp {
+    pub word: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Full STT result: joined text plus per-word timestamps.
+pub struct Transcription {
+    pub text: String,
+    pub words: Vec<WordTimestamp>,
+}
 
 pub struct WhisperEngine {
     ctx: WhisperContext,
@@ -2236,7 +2345,7 @@ impl WhisperEngine {
         Ok(Self { ctx })
     }
 
-    pub fn transcribe(&mut self, wav_path: &Path) -> Result<String, String> {
+    pub fn transcribe(&mut self, wav_path: &Path) -> Result<Transcription, String> {
         // Read WAV
         let mut reader = hound::WavReader::open(wav_path).map_err(|e| e.to_string())?;
         let spec = reader.spec();
@@ -2276,11 +2385,37 @@ impl WhisperEngine {
 
         let n = state.full_n_segments().map_err(|e| format!("{:?}", e))?;
         let mut text = String::new();
+        let mut words: Vec<WordTimestamp> = Vec::new();
+
         for i in 0..n {
-            text.push_str(&state.full_get_segment_text(i).map_err(|e| format!("{:?}", e))?);
+            let seg_text = state.full_get_segment_text(i).map_err(|e| format!("{:?}", e))?;
+            text.push_str(&seg_text);
+
+            // Segment timestamps are in centiseconds (10ms units) — convert to ms.
+            // If Step 2b found a different unit/accessor, adjust here.
+            let t0_ms = state.full_get_segment_t0(i).map_err(|e| format!("{:?}", e))? as u64 * 10;
+            let t1_ms = state.full_get_segment_t1(i).map_err(|e| format!("{:?}", e))? as u64 * 10;
+
+            // Distribute the segment's words evenly across [t0, t1]. The gap to the
+            // NEXT segment's t0 is preserved as a pause (fluency.rs reads it).
+            let seg_words: Vec<&str> = seg_text.split_whitespace().collect();
+            if seg_words.is_empty() {
+                continue;
+            }
+            let span = t1_ms.saturating_sub(t0_ms).max(1);
+            let per = span / seg_words.len() as u64;
+            for (j, w) in seg_words.iter().enumerate() {
+                let ws = t0_ms + per * j as u64;
+                let we = if j + 1 == seg_words.len() { t1_ms } else { ws + per };
+                words.push(WordTimestamp {
+                    word: w.to_string(),
+                    start_ms: ws,
+                    end_ms: we,
+                });
+            }
         }
 
-        Ok(text.trim().to_string())
+        Ok(Transcription { text: text.trim().to_string(), words })
     }
 }
 
@@ -2469,6 +2604,169 @@ git commit -m "feat: word-level diff using similar crate"
 
 ---
 
+### Task 15B: Pacing Metrics (fluency.rs)
+
+**Files:**
+- Modify: `src-tauri/src/fluency.rs`
+
+> Depends on Task 14 Step 2b (timestamp verification). If that step found only text (no timestamps), implement the documented duration-only fallback instead of the code below and set pause fields to 0.
+
+- [ ] **Step 1: Write pacing tests**
+
+Replace the stub in `src-tauri/src/fluency.rs` with tests. `LONG_PAUSE_MS = 250` is the standard minimum-pause threshold from the fluency literature (see design spec).
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stt::WordTimestamp;
+
+    fn w(word: &str, start_ms: u64, end_ms: u64) -> WordTimestamp {
+        WordTimestamp { word: word.to_string(), start_ms, end_ms }
+    }
+
+    #[test]
+    fn empty_words_yields_zero() {
+        let m = compute_pacing(&[]);
+        assert_eq!(m.words_per_minute, 0.0);
+        assert_eq!(m.pause_count, 0);
+    }
+
+    #[test]
+    fn three_words_over_one_second_is_180_wpm() {
+        // words span 0..1000ms, no gaps → 3 words / 1s = 180 wpm
+        let words = vec![w("a", 0, 300), w("b", 300, 600), w("c", 600, 1000)];
+        let m = compute_pacing(&words);
+        assert!((m.words_per_minute - 180.0).abs() < 1.0);
+        assert_eq!(m.pause_count, 0);
+        assert_eq!(m.total_pause_ms, 0);
+    }
+
+    #[test]
+    fn gap_over_threshold_counts_as_pause() {
+        // 500ms gap between b and c → 1 pause, 1 long hesitation
+        let words = vec![w("a", 0, 300), w("b", 300, 600), w("c", 1100, 1400)];
+        let m = compute_pacing(&words);
+        assert_eq!(m.pause_count, 1);
+        assert_eq!(m.total_pause_ms, 500);
+        assert_eq!(m.long_hesitations, 1);
+        // articulation rate (excludes pause time) > wpm (includes it)
+        assert!(m.articulation_rate > m.words_per_minute);
+        assert!(m.pause_ratio > 0.0 && m.pause_ratio < 1.0);
+    }
+}
+```
+
+- [ ] **Step 2: Run tests — verify they fail**
+
+```bash
+cd src-tauri && cargo test fluency::tests
+```
+
+Expected: FAIL — `compute_pacing` returns `PacingMetrics::default()` (all zeros), so the non-zero assertions fail.
+
+- [ ] **Step 3: Implement `src-tauri/src/fluency.rs`**
+
+```rust
+use crate::events::PacingMetrics;
+use crate::stt::WordTimestamp;
+
+/// Minimum silent gap (ms) counted as a pause / long hesitation.
+/// 250ms is the standard minimum pause threshold in the fluency literature.
+const LONG_PAUSE_MS: u64 = 250;
+
+pub fn compute_pacing(words: &[WordTimestamp]) -> PacingMetrics {
+    if words.is_empty() {
+        return PacingMetrics::default();
+    }
+
+    let first_start = words.first().unwrap().start_ms;
+    let last_end = words.last().unwrap().end_ms;
+    let total_ms = last_end.saturating_sub(first_start).max(1);
+
+    // Sum inter-word gaps that exceed the pause threshold.
+    let mut total_pause_ms: u64 = 0;
+    let mut pause_count: u32 = 0;
+    let mut long_hesitations: u32 = 0;
+    for pair in words.windows(2) {
+        let gap = pair[1].start_ms.saturating_sub(pair[0].end_ms);
+        if gap >= LONG_PAUSE_MS {
+            total_pause_ms += gap;
+            pause_count += 1;
+            long_hesitations += 1;
+        }
+    }
+
+    let word_count = words.len() as f32;
+    let total_min = total_ms as f32 / 60_000.0;
+    let speaking_ms = total_ms.saturating_sub(total_pause_ms).max(1);
+    let speaking_min = speaking_ms as f32 / 60_000.0;
+
+    PacingMetrics {
+        words_per_minute: word_count / total_min,
+        articulation_rate: word_count / speaking_min, // excludes pause time
+        pause_count,
+        total_pause_ms: total_pause_ms as u32,
+        pause_ratio: total_pause_ms as f32 / total_ms as f32,
+        long_hesitations,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stt::WordTimestamp;
+
+    fn w(word: &str, start_ms: u64, end_ms: u64) -> WordTimestamp {
+        WordTimestamp { word: word.to_string(), start_ms, end_ms }
+    }
+
+    #[test]
+    fn empty_words_yields_zero() {
+        let m = compute_pacing(&[]);
+        assert_eq!(m.words_per_minute, 0.0);
+        assert_eq!(m.pause_count, 0);
+    }
+
+    #[test]
+    fn three_words_over_one_second_is_180_wpm() {
+        let words = vec![w("a", 0, 300), w("b", 300, 600), w("c", 600, 1000)];
+        let m = compute_pacing(&words);
+        assert!((m.words_per_minute - 180.0).abs() < 1.0);
+        assert_eq!(m.pause_count, 0);
+        assert_eq!(m.total_pause_ms, 0);
+    }
+
+    #[test]
+    fn gap_over_threshold_counts_as_pause() {
+        let words = vec![w("a", 0, 300), w("b", 300, 600), w("c", 1100, 1400)];
+        let m = compute_pacing(&words);
+        assert_eq!(m.pause_count, 1);
+        assert_eq!(m.total_pause_ms, 500);
+        assert_eq!(m.long_hesitations, 1);
+        assert!(m.articulation_rate > m.words_per_minute);
+        assert!(m.pause_ratio > 0.0 && m.pause_ratio < 1.0);
+    }
+}
+```
+
+- [ ] **Step 4: Run tests — verify they pass**
+
+```bash
+cd src-tauri && cargo test fluency::tests
+```
+
+Expected: PASS (3 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src-tauri/src/fluency.rs
+git commit -m "feat: pacing metrics (wpm, articulation rate, pauses) from word timestamps"
+```
+
+---
+
 ### Task 16: LLM Feedback Client
 
 **Files:**
@@ -2481,12 +2779,13 @@ Add to `src-tauri/src/llm.rs`:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::PacingMetrics;
 
     #[tokio::test]
     async fn returns_fallback_when_llm_unreachable() {
         // Point at a port with nothing listening
         std::env::set_var("OMLX_BASE_URL", "http://127.0.0.1:19999/v1");
-        let result = get_feedback("hello", "hello").await;
+        let result = get_feedback("hello", "hello", &[], &PacingMetrics::default()).await;
         // Should not panic — errors are swallowed by caller
         // (returns Err which caller maps to (0, []))
         assert!(result.is_err());
@@ -2508,7 +2807,7 @@ Expected: FAIL — function is stub returning `Ok((0, vec![]))`, test expects `E
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::events::LlmComment;
+use crate::events::{DiffToken, LlmComment, PacingMetrics};
 
 #[derive(Deserialize, Debug)]
 struct LlmResponse {
@@ -2522,9 +2821,15 @@ struct LlmCommentRaw {
     text: String,
 }
 
+/// The diff and pacing are computed deterministically in Rust (diff.rs / fluency.rs).
+/// The LLM only summarizes them into a score + coaching comments — it does NOT
+/// recompute the diff. We pass the already-computed diff + pacing so its comments
+/// are grounded in the same numbers the UI shows.
 pub async fn get_feedback(
     original: &str,
     transcription: &str,
+    diff: &[DiffToken],
+    pacing: &PacingMetrics,
 ) -> Result<(u32, Vec<LlmComment>), String> {
     let base_url =
         std::env::var("OMLX_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8002/v1".into());
@@ -2532,8 +2837,44 @@ pub async fn get_feedback(
     let model =
         std::env::var("OMLX_MODEL").unwrap_or_else(|_| "default".into());
 
+    // Summarize the Rust-computed diff for the prompt.
+    let missed: Vec<&str> = diff.iter()
+        .filter(|t| t.token_type == "missed")
+        .map(|t| t.text.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let added: Vec<&str> = diff.iter()
+        .filter(|t| t.token_type == "added")
+        .map(|t| t.text.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let prompt = format!(
-        "Compare the student's spoken English to the original text.\n\nOriginal: {original}\n\nStudent said: {transcription}\n\nReturn ONLY a JSON object with:\n- \"score\": integer 0-100 (accuracy + fluency combined)\n- \"comments\": array of 3-5 objects with \"icon\" (emoji) and \"text\" (specific coaching tip)\n\nFocus on dropped word endings, skipped words, mispronunciations. Be specific and constructive."
+        "You are coaching a Chinese-native English learner on a read-aloud exercise. \
+All metrics below are already computed — do NOT recompute them, just interpret them.\n\n\
+Original text: {original}\n\n\
+What they said (ASR): {transcription}\n\n\
+CONTENT DIFF (computed):\n- Missed/substituted words: {missed:?}\n- Extra/substituted words said: {added:?}\n\n\
+PACING METRICS (computed):\n\
+- Words per minute: {wpm:.0}\n\
+- Articulation rate (excl. pauses): {art:.0}\n\
+- Pause count: {pc}\n- Total pause time: {tp} ms\n- Pause ratio: {pr:.2}\n- Long hesitations: {lh}\n\n\
+Note: ASR normalizes pronunciation, so do NOT claim specific phoneme/word-ending mispronunciations — \
+focus on CONTENT ACCURACY (missed/extra words) and FLUENCY/PACING (rate, pauses, hesitations). \
+A natural read-aloud pace is ~150-170 wpm.\n\n\
+Return ONLY a JSON object (no markdown fences):\n\
+- \"score\": integer 0-100 combining content accuracy and fluency\n\
+- \"comments\": array of 3-5 objects, each with \"icon\" (a single emoji) and \"text\" (one specific, constructive tip)",
+        original = original,
+        transcription = transcription,
+        missed = missed,
+        added = added,
+        wpm = pacing.words_per_minute,
+        art = pacing.articulation_rate,
+        pc = pacing.pause_count,
+        tp = pacing.total_pause_ms,
+        pr = pacing.pause_ratio,
+        lh = pacing.long_hesitations,
     );
 
     let body = serde_json::json!({
@@ -2541,7 +2882,7 @@ pub async fn get_feedback(
         "messages": [
             {
                 "role": "system",
-                "content": "You are an English pronunciation and fluency coach for non-native speakers. Return only valid JSON. No markdown fences."
+                "content": "You are an English fluency and read-aloud coach for non-native speakers. You interpret pre-computed content-diff and pacing metrics. Return only valid JSON. No markdown fences."
             },
             {
                 "role": "user",
@@ -2581,11 +2922,12 @@ pub async fn get_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::PacingMetrics;
 
     #[tokio::test]
     async fn returns_err_when_llm_unreachable() {
         std::env::set_var("OMLX_BASE_URL", "http://127.0.0.1:19999/v1");
-        let result = get_feedback("hello", "hello").await;
+        let result = get_feedback("hello", "hello", &[], &PacingMetrics::default()).await;
         assert!(result.is_err());
     }
 }
@@ -2650,14 +2992,15 @@ Manual test checklist:
 - [ ] Click Read Aloud → TTS plays at selected speed
 - [ ] Click Record → waveform animates while speaking
 - [ ] Click Stop → "Analyzing…" appears
-- [ ] Feedback panel renders: score ring, diff view, LLM comments
+- [ ] Feedback panel renders: score ring, pacing metrics (wpm/pauses), diff view, LLM comments
+- [ ] Pacing numbers look plausible (wpm in a sane range, pause count non-negative)
 - [ ] Click Re-record → clears feedback, ready to record again
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add src-tauri/
-git commit -m "feat: wire stop_recording to full STT + diff + LLM pipeline"
+git commit -m "feat: wire stop_recording to full STT + diff + pacing + LLM pipeline"
 ```
 
 ---
@@ -2685,7 +3028,15 @@ const MOCK_FEEDBACK = {
     { text: "world", type: "missed" as const },
     { text: "earth", type: "added" as const },
   ],
-  comments: [{ icon: "🔤", text: "Practice word endings." }],
+  pacing: {
+    wordsPerMinute: 142,
+    articulationRate: 168,
+    pauseCount: 6,
+    totalPauseMs: 4200,
+    pauseRatio: 0.21,
+    longHesitations: 2,
+  },
+  comments: [{ icon: "🐢", text: "Aim for 150–170 wpm." }],
 };
 
 describe("FeedbackPanel", () => {
@@ -2708,10 +3059,17 @@ describe("FeedbackPanel", () => {
     expect(screen.getByText(/hello/)).toBeInTheDocument();
   });
 
+  it("renders pacing metrics", () => {
+    useAppStore.setState({ feedback: MOCK_FEEDBACK } as any);
+    render(<FeedbackPanel />);
+    expect(screen.getByText(/142/)).toBeInTheDocument();   // wpm
+    expect(screen.getByText(/6 pauses/i)).toBeInTheDocument();
+  });
+
   it("renders LLM comment", () => {
     useAppStore.setState({ feedback: MOCK_FEEDBACK } as any);
     render(<FeedbackPanel />);
-    expect(screen.getByText(/Practice word endings/)).toBeInTheDocument();
+    expect(screen.getByText(/150–170 wpm/)).toBeInTheDocument();
   });
 });
 ```
@@ -2728,7 +3086,18 @@ Expected: FAIL.
 
 ```tsx
 import { useAppStore } from "../store/useAppStore";
-import type { DiffToken } from "../types";
+import type { DiffToken, PacingMetrics } from "../types";
+
+function PacingReadout({ pacing }: { pacing: PacingMetrics }) {
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-[12px] text-white/55">
+      <span><span className="text-indigo-300 font-medium">{Math.round(pacing.wordsPerMinute)}</span> wpm</span>
+      <span><span className="text-indigo-300 font-medium">{pacing.pauseCount}</span> pauses</span>
+      <span><span className="text-indigo-300 font-medium">{pacing.longHesitations}</span> long hesitations</span>
+      <span><span className="text-indigo-300 font-medium">{Math.round(pacing.pauseRatio * 100)}%</span> pause ratio</span>
+    </div>
+  );
+}
 
 function ScoreRing({ score }: { score: number }) {
   const r = 26;
@@ -2800,6 +3169,9 @@ export default function FeedbackPanel() {
         </div>
       </div>
 
+      {/* Pacing metrics */}
+      <PacingReadout pacing={feedback.pacing} />
+
       {/* Diff view */}
       <p className="text-[10px] text-white/25 uppercase tracking-widest mb-1.5">
         What you said vs original
@@ -2849,7 +3221,7 @@ export default function FeedbackPanel() {
 npx vitest run src/components/__tests__/FeedbackPanel.test.tsx
 ```
 
-Expected: PASS (4 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 5: Add FeedbackPanel to `src/App.tsx`**
 
@@ -2889,7 +3261,7 @@ git commit -m "feat: FeedbackPanel with score ring, diff view, and LLM comments"
 
 ## What This Is
 
-**azReadAnalyzer** is a macOS desktop app for English speaking practice. Capture text via screenshot OCR or clipboard paste, listen to TTS playback, record yourself reading, and receive Whisper STT + LLM fluency feedback. 100% on-device.
+**azReadAnalyzer** is a macOS desktop app for English speaking practice. Capture text via screenshot OCR or clipboard paste, listen to TTS playback, record yourself reading, and receive feedback on content accuracy (Rust-computed diff), fluency/pacing (Rust-computed metrics from Whisper word timestamps), and LLM coaching (score + comments). 100% on-device. Phoneme-level pronunciation feedback (GOP/forced alignment) is deferred to v2 — see the design spec's Feedback Methodology section.
 
 ## Commands
 
@@ -2977,7 +3349,7 @@ Start all three services and run `npx tauri dev`. Work through the full practice
 3. Change speed to 0.75x → play again at slower speed ✓
 4. Click Record → speak the text aloud → waveform animates ✓
 5. Click Stop → "Analyzing…" appears ✓
-6. Feedback panel appears: score ring, colored diff, LLM comments ✓
+6. Feedback panel appears: score ring, pacing metrics (wpm/pauses/hesitations), colored diff, LLM comments ✓
 7. Click Re-record → feedback clears, ready to record again ✓
 8. Click New Text → clears everything ✓
 9. Click Screenshot → draw region over text on screen → text extracted and populated ✓
@@ -2999,18 +3371,26 @@ git push -u origin master
 
 ## Self-Review Checklist
 
+Mapped against the design spec (spec ↔ task):
+
 - **Clipboard paste** → Task 5 (clipboard.rs + CaptureControls) ✓
-- **Screenshot OCR** → Task 6 (ocr_service) + Task 7 (capture.rs) + Task 8 (CaptureControls) ✓
-- **TTS playback with speed control** → Task 9 (sidecar) + Task 11 (PlaybackControls) ✓
+- **Screenshot OCR (HTTP only)** → Task 6 (ocr_service) + Task 7 (capture.rs) + Task 8 (CaptureControls) ✓
+- **TTS synthesis sidecar + client-side HTML5 Audio playback/speed/progress** → Task 9 (sidecar) + Task 11 (PlaybackControls) ✓
 - **Mic recording with waveform** → Task 12 (audio.rs) + Task 13 (RecordingPanel) ✓
-- **Whisper STT** → Task 14 (stt.rs) ✓
-- **Word-level diff** → Task 15 (diff.rs) ✓
-- **LLM fluency feedback** → Task 16 (llm.rs) ✓
-- **FeedbackPanel (score + diff + comments)** → Task 18 ✓
-- **Mock mode (VITE_USE_MOCK)** → Task 4 (useMockEvents) ✓
+- **Whisper STT with word timestamps** → Task 14 (stt.rs, incl. Step 2b transcribe-rs timestamp verification) ✓
+- **Deterministic Rust-owned word-level diff** → Task 15 (diff.rs) ✓
+- **Pacing/fluency metrics (wpm, articulation rate, pauses, hesitations)** → Task 15B (fluency.rs) ✓
+- **LLM returns score + comments ONLY (receives diff + pacing)** → Task 16 (llm.rs) ✓
+- **FeedbackPanel (score ring + pacing readout + diff + comments)** → Task 18 ✓
+- **PacingMetrics type + camelCase serde bridge** → Task 2 (events.rs) + Task 4 (types/index.ts) ✓
+- **Mock mode (VITE_USE_MOCK) incl. pacing** → Task 4 (useMockEvents) ✓
+- **Unique temp paths (screenshot + recording)** → Task 7 (capture.rs) + Task 12 (audio.rs) ✓
 - **Error toasts for sidecar failures** → CaptureControls + PlaybackControls ✓
-- **Screen Recording permission toast** → not in components yet — add to capture_screenshot error handling in CaptureControls (already handled via the generic addToast in Task 8) ✓
+- **Screen Recording permission** → handled via generic addToast in Task 8 ✓
 - **azVoiceAssist color theme** → Task 3 (index.css with az-bg, az-accent) ✓
 - **Two-panel resizable layout** → Task 3 (App.tsx with PanelGroup) ✓
 - **Custom titlebar with traffic lights** → Task 3 ✓
 - **CLAUDE.md** → Task 19 ✓
+- **Out of scope confirmed:** phoneme-level pronunciation / dropped-ending (GOP) is NOT in any task — deferred to v2 per spec ✓
+
+**Type-consistency check across tasks:** `PacingMetrics` fields (camelCase TS / snake_case Rust + `#[serde(rename_all="camelCase")]`) match between events.rs (Task 2), types/index.ts (Task 4), fluency.rs (Task 15B), mock (Task 4), and FeedbackPanel (Task 18). `Transcription { text, words }` and `WordTimestamp { word, start_ms, end_ms }` defined once in stt.rs (Tasks 2/14), consumed by fluency.rs and commands.rs. `get_feedback(original, transcription, diff, pacing)` signature consistent across stub (Task 2), tests, and impl (Task 16) and call site (Task 2 commands.rs). ✓
