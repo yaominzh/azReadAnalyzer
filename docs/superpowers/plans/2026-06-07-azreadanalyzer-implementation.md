@@ -308,11 +308,12 @@ similar = "2"
 # STT
 transcribe-rs = { version = "0.3.11", features = ["whisper-cpp"] }
 
+# Unique temp files (screenshot PNG + recording WAV); auto-deleted on drop.
+# In [dependencies] (not dev-only) because runtime code uses it.
+tempfile = "3"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 transcribe-rs = { version = "0.3.11", features = ["whisper-cpp", "whisper-metal"] }
-
-[dev-dependencies]
-tempfile = "3"
 ```
 
 - [ ] **Step 2: Create `src-tauri/build.rs`**
@@ -348,7 +349,8 @@ fn main() {
         "minHeight": 500,
         "resizable": true,
         "fullscreen": false,
-        "decorations": false
+        "decorations": false,
+        "alwaysOnTop": true
       }
     ],
     "withGlobalTauri": true,
@@ -405,6 +407,7 @@ pub fn run() {
             commands::paste_clipboard,
             commands::capture_screenshot,
             commands::play_tts,
+            commands::set_always_on_top,
             commands::start_recording,
             commands::stop_recording,
         ])
@@ -460,7 +463,10 @@ pub struct PacingMetrics {
 
 #[derive(Serialize, Clone)]
 pub struct FeedbackReadyPayload {
-    pub score: u32,
+    // score is None when the LLM was unreachable — the UI then shows diff +
+    // pacing (both computed locally in Rust) but suppresses the score ring and
+    // comments, per spec ("transcription only, no score/comments").
+    pub score: Option<u32>,
     pub transcription: String,
     pub diff: Vec<DiffToken>,
     pub pacing: PacingMetrics,
@@ -510,8 +516,28 @@ pub fn paste_clipboard() -> Result<String, String> {
 
 #[command]
 pub async fn capture_screenshot(app: AppHandle) -> Result<(), String> {
-    let path = crate::capture::capture_screen_region().await?;
-    let text = crate::capture::call_ocr_sidecar(&path).await?;
+    use tauri::Manager;
+    let window = app.get_webview_window("main");
+
+    // Hide our window so it isn't captured / doesn't block the target.
+    if let Some(w) = &window {
+        w.hide().ok();
+    }
+
+    // Run capture + OCR, always restoring the window afterward.
+    let outcome = async {
+        // `temp` is a NamedTempFile (unique path); dropped at end of this block → auto-deleted.
+        let temp = crate::capture::capture_screen_region().await?;
+        crate::capture::call_ocr_sidecar(temp.path()).await
+    }
+    .await;
+
+    if let Some(w) = &window {
+        w.show().ok();
+        w.set_focus().ok();
+    }
+
+    let text = outcome?;
     crate::events::emit_text_captured(&app, text);
     Ok(())
 }
@@ -519,6 +545,15 @@ pub async fn capture_screenshot(app: AppHandle) -> Result<(), String> {
 #[command]
 pub async fn play_tts(text: String) -> Result<Vec<u8>, String> {
     crate::capture::call_tts_sidecar(&text).await
+}
+
+#[command]
+pub fn set_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        w.set_always_on_top(enabled).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[command]
@@ -538,7 +573,8 @@ pub async fn stop_recording(
     state: State<'_, Arc<AppState>>,
     original_text: String,
 ) -> Result<(), String> {
-    let wav_path = {
+    // `wav` is a NamedTempFile (unique path, auto-deleted when dropped at fn end).
+    let wav = {
         let mut rec = state.recorder.lock().map_err(|e| e.to_string())?;
         let recorder = rec.take().ok_or("Not recording")?;
         recorder.stop()?
@@ -550,15 +586,22 @@ pub async fn stop_recording(
     let result = {
         let mut eng = state.stt_engine.lock().map_err(|e| e.to_string())?;
         let engine = eng.as_mut().ok_or("Whisper not loaded")?;
-        engine.transcribe(&wav_path)?
+        engine.transcribe(wav.path())?
     };
 
     let diff = crate::diff::word_diff(&original_text, &result.text);
     let pacing = crate::fluency::compute_pacing(&result.words);
+
+    // LLM is best-effort. If it's unreachable, score = None and comments = [];
+    // the UI still shows the locally-computed diff + pacing.
     let (score, comments) =
-        crate::llm::get_feedback(&original_text, &result.text, &diff, &pacing)
-            .await
-            .unwrap_or((0, vec![]));
+        match crate::llm::get_feedback(&original_text, &result.text, &diff, &pacing).await {
+            Ok((s, c)) => (Some(s), c),
+            Err(e) => {
+                log::warn!("LLM feedback unavailable: {e}");
+                (None, vec![])
+            }
+        };
 
     crate::events::emit_feedback_ready(
         &app,
@@ -572,6 +615,7 @@ pub async fn stop_recording(
     );
     crate::events::emit_recording_state(&app, "idle");
     Ok(())
+    // `wav` (a NamedTempFile) drops here → recording file auto-deleted.
 }
 ```
 
@@ -579,9 +623,11 @@ pub async fn stop_recording(
 
 Create `src-tauri/src/capture.rs`:
 ```rust
-use std::path::PathBuf;
-pub async fn capture_screen_region() -> Result<PathBuf, String> { todo!() }
-pub async fn call_ocr_sidecar(_path: &PathBuf) -> Result<String, String> { todo!() }
+use std::path::Path;
+use tempfile::NamedTempFile;
+// Returns a NamedTempFile (unique path, auto-deleted on drop) holding the screenshot PNG.
+pub async fn capture_screen_region() -> Result<NamedTempFile, String> { todo!() }
+pub async fn call_ocr_sidecar(_path: &Path) -> Result<String, String> { todo!() }
 pub async fn call_tts_sidecar(_text: &str) -> Result<Vec<u8>, String> { todo!() }
 ```
 
@@ -593,10 +639,12 @@ pub fn read_text() -> Result<String, String> { todo!() }
 Create `src-tauri/src/audio.rs`:
 ```rust
 use tauri::AppHandle;
+use tempfile::NamedTempFile;
 pub struct Recorder;
 impl Recorder {
     pub fn start(_app: AppHandle) -> Result<Self, String> { todo!() }
-    pub fn stop(self) -> Result<std::path::PathBuf, String> { todo!() }
+    // Returns a NamedTempFile (unique path, auto-deleted on drop) holding the recording WAV.
+    pub fn stop(self) -> Result<NamedTempFile, String> { todo!() }
 }
 ```
 
@@ -742,9 +790,20 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 - [ ] **Step 4: Create `src/App.tsx`** (shell with two-panel layout + custom titlebar)
 
 ```tsx
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { PanelGroup, Panel, PanelResizeHandle } from "react-resizable-panels";
 
 export default function App() {
+  // Window starts always-on-top (tauri.conf.json alwaysOnTop: true); toggle flips it.
+  const [alwaysOnTop, setAlwaysOnTop] = useState(true);
+
+  function toggleAlwaysOnTop() {
+    const next = !alwaysOnTop;
+    setAlwaysOnTop(next);
+    invoke("set_always_on_top", { enabled: next }).catch(() => {});
+  }
+
   return (
     <div className="flex flex-col h-screen bg-[#080808]">
       {/* Custom titlebar */}
@@ -757,12 +816,15 @@ export default function App() {
         <span className="text-[13px] font-medium text-white/40 tracking-wider">
           azReadAnalyzer
         </span>
-        <div className="flex items-center gap-2 text-[11px] text-white/30">
+        <button
+          onClick={toggleAlwaysOnTop}
+          className="flex items-center gap-2 text-[11px] text-white/30 hover:text-white/60 transition-colors"
+        >
           <span>Always on top</span>
-          <div className="w-7 h-4 rounded-full bg-[#6366f1]/50 relative">
-            <div className="absolute top-0.5 left-3.5 w-3 h-3 rounded-full bg-white" />
+          <div className={`w-7 h-4 rounded-full relative transition-colors ${alwaysOnTop ? "bg-[#6366f1]/50" : "bg-white/10"}`}>
+            <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${alwaysOnTop ? "left-3.5" : "left-0.5"}`} />
           </div>
-        </div>
+        </button>
       </div>
 
       {/* Two-panel body */}
@@ -904,7 +966,7 @@ export interface PacingMetrics {
 
 // Full feedback result
 export interface FeedbackResult {
-  score: number;
+  score: number | null;   // null when the LLM was unreachable (diff + pacing still shown)
   transcription: string;
   diff: DiffToken[];
   pacing: PacingMetrics;
@@ -925,7 +987,7 @@ export interface RecordingStatePayload {
 }
 
 export interface FeedbackReadyPayload {
-  score: number;
+  score: number | null;   // null = LLM unreachable (Rust sends None)
   transcription: string;
   diff: DiffToken[];
   pacing: PacingMetrics;
@@ -1366,25 +1428,36 @@ mod tests {
 
 ```rust
 use reqwest::Client;
-use std::path::PathBuf;
+use std::path::Path;
+use tempfile::NamedTempFile;
 
-pub async fn capture_screen_region() -> Result<PathBuf, String> {
-    let path = PathBuf::from("/tmp/az_capture.png");
+pub async fn capture_screen_region() -> Result<NamedTempFile, String> {
+    // Unique temp file with a .png suffix; auto-deleted when the returned
+    // handle is dropped by the caller (after OCR consumes it).
+    let temp = tempfile::Builder::new()
+        .prefix("az_capture_")
+        .suffix(".png")
+        .tempfile()
+        .map_err(|e| format!("temp file: {e}"))?;
+    let path = temp.path().to_path_buf();
 
-    // screencapture -i: interactive region selection; exits with non-zero if cancelled
+    // screencapture -i: interactive region selection; exits non-zero if cancelled.
+    // It overwrites the (empty) temp file at `path`.
     let status = std::process::Command::new("screencapture")
         .args(["-i", path.to_str().unwrap()])
         .status()
         .map_err(|e| format!("screencapture failed: {e}"))?;
 
-    if !status.success() || !path.exists() {
+    // Cancelled → file left empty (0 bytes). Treat empty as cancelled.
+    let empty = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+    if !status.success() || empty {
         return Err("Screenshot cancelled".into());
     }
 
-    Ok(path)
+    Ok(temp)
 }
 
-pub async fn call_ocr_sidecar(image_path: &PathBuf) -> Result<String, String> {
+pub async fn call_ocr_sidecar(image_path: &Path) -> Result<String, String> {
     let client = Client::new();
     let resp = client
         .post("http://127.0.0.1:8124/ocr")
@@ -1921,7 +1994,6 @@ mod tests {
 - [ ] **Step 2: Implement `src-tauri/src/audio.rs`**
 
 ```rust
-use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -1929,6 +2001,7 @@ use std::sync::{
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tauri::AppHandle;
+use tempfile::NamedTempFile;
 
 pub struct Recorder {
     _stream: cpal::Stream,
@@ -1968,7 +2041,9 @@ impl Recorder {
                     let rms = (data.iter().map(|s| s * s).sum::<f32>() / data.len() as f32)
                         .sqrt()
                         .min(1.0);
-                    app.emit("audio-level", rms).ok();
+                    // Use the typed helper so the payload is {level: f32} (frontend
+                    // reads e.payload.level) and the Emitter trait is in scope.
+                    crate::events::emit_audio_level(&app, rms);
 
                     samples_cb.lock().unwrap().extend_from_slice(data);
                 },
@@ -1988,7 +2063,7 @@ impl Recorder {
         })
     }
 
-    pub fn stop(self) -> Result<PathBuf, String> {
+    pub fn stop(self) -> Result<NamedTempFile, String> {
         self.stop_flag.store(true, Ordering::Relaxed);
         // _stream is dropped here, stopping the stream
 
@@ -2003,7 +2078,13 @@ impl Recorder {
             raw.clone()
         };
 
-        let path = PathBuf::from("/tmp/az_recording.wav");
+        // Unique temp WAV; auto-deleted when the caller drops the handle (after STT).
+        let temp = tempfile::Builder::new()
+            .prefix("az_recording_")
+            .suffix(".wav")
+            .tempfile()
+            .map_err(|e| format!("temp file: {e}"))?;
+
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: self.sample_rate,
@@ -2011,14 +2092,14 @@ impl Recorder {
             sample_format: hound::SampleFormat::Int,
         };
 
-        let mut writer = hound::WavWriter::create(&path, spec).map_err(|e| e.to_string())?;
+        let mut writer = hound::WavWriter::create(temp.path(), spec).map_err(|e| e.to_string())?;
         for sample in mono {
             let s = (sample * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
             writer.write_sample(s).map_err(|e| e.to_string())?;
         }
         writer.finalize().map_err(|e| e.to_string())?;
 
-        Ok(path)
+        Ok(temp)
     }
 }
 
@@ -2287,32 +2368,38 @@ curl -L -o ~/.azreadanalyzer/models/ggml-base.en.bin \
 
 Expected: ~141MB download. Verify: `ls -lh ~/.azreadanalyzer/models/ggml-base.en.bin`
 
-- [ ] **Step 2b: Verify transcribe-rs timestamp support (BLOCKING — do before fluency.rs in Task 15B)**
+- [ ] **Step 2b: Confirm the transcribe-rs API surface (BLOCKING — do before writing Step 3)**
 
-The design spec flags this as a known risk: `fluency.rs` needs per-segment (or per-word) timestamps, and it's unverified that `transcribe-rs` 0.3.11 surfaces them. Inspect the crate's API before relying on it:
+The real transcribe-rs 0.3.11 API was verified against MeetBuddy's working code + docs.rs, and Step 3 below is written to it. Before implementing, confirm it still holds for the installed version (the crate wraps whisper-rs internally, so don't assume whisper-rs's `WhisperContext`/`state.full()` surface — that is NOT transcribe-rs's public API):
 
 ```bash
-# Find the installed crate source and grep for timestamp accessors
-find ~/.cargo/registry/src -type d -name "transcribe-rs-*" 2>/dev/null
-grep -rn "segment_t0\|segment_t1\|token_timestamps\|full_get_segment_t\|start\|end" \
-  "$(find ~/.cargo/registry/src -type d -name 'transcribe-rs-*' | head -1)/src" | head -40
+# Confirm the engine + result types compile by checking the crate source/docs.
+cargo doc -p transcribe-rs --no-deps 2>/dev/null && \
+  echo "open target/doc/transcribe_rs/index.html" || \
+  echo "see https://docs.rs/transcribe-rs/0.3.11"
 ```
 
-Expected outcomes and how to proceed:
-- **Segment timestamps exposed** (e.g. `full_get_segment_t0/t1`, in centiseconds): use them — this is the common case and is sufficient. Whisper breaks segments at natural pauses, so inter-segment gaps are a good pause proxy. Implement Step 3 as written below.
-- **Only text exposed (no timestamps):** Step 3's segment-timestamp calls won't compile. Fallback: derive a coarse pacing signal from total audio duration (WAV length via `hound`) ÷ word count for WPM, and record `pauseCount = 0` (document the limitation). Note this in `fluency.rs` and the FeedbackPanel ("pause metrics unavailable").
-- **Word/token timestamps exposed:** even better — populate `WordTimestamp` directly instead of distributing within segments.
+Verified facts Step 3 relies on (confirm these names exist):
+- Engine: `transcribe_rs::whisper_cpp::WhisperEngine` with `WhisperEngine::load(path)` and `transcribe_with(&[f32], &WhisperInferenceParams) -> Result<TranscriptionResult>`.
+- `transcribe_rs::TranscriptionResult { text: String, segments: Option<Vec<TranscriptionSegment>> }`.
+- `transcribe_rs::TranscriptionSegment { start: f32 /* seconds */, end: f32 /* seconds */, text: String }`.
 
-Record what you found in a one-line comment at the top of `stt.rs` so the next task knows which path was taken.
+This gives **segment-level** timestamps (start/end in seconds) — sufficient for pacing. There are NO word-level timestamps, so Step 3 distributes a segment's words evenly across its `[start, end]` span and treats inter-segment gaps as pauses.
+
+Fallbacks if a name differs:
+- If `segments` comes back `None` (some param configs): Step 3 already falls back to one synthetic segment spanning the whole clip → WPM still computed, `pauseCount = 0`.
+- If `transcribe_with`/`WhisperInferenceParams` names differ in the installed version, adjust to the actual signature (the MeetBuddy reference at `meetbuddy/src-tauri/src/stt/whisper_engine.rs` is known-good for 0.3.11).
 
 - [ ] **Step 3: Implement `src-tauri/src/stt.rs`**
 
-The `transcribe` method returns a `Transcription { text, words }`. Words are built from per-segment timestamps: each segment's words are distributed evenly across the segment's `[t0, t1]` span, and the natural silence *between* segments is preserved as a gap between the last word of one segment and the first word of the next — which is exactly what `fluency.rs` reads as a pause. (If Step 2b found only text, use the fallback described there instead.)
+The `transcribe` method decodes the WAV to 16 kHz mono f32 samples, runs `transcribe_with`, then builds `Transcription { text, words }` from `result.segments`: each segment's words are distributed evenly across the segment's `[start, end]` span (converted seconds → ms), and the silence *between* segments is preserved as a gap between the last word of one segment and the first of the next — which is what `fluency.rs` reads as a pause. The crate's engine type `WhisperEngine` is imported under an alias to avoid colliding with our own `WhisperEngine` struct.
 
 ```rust
 // stt.rs — transcribe-rs timestamp granularity used: SEGMENT-level (see Task 14 Step 2b).
+// stt.rs — uses transcribe-rs SEGMENT-level timestamps (start/end in seconds).
 use std::path::{Path, PathBuf};
-use transcribe_rs::{WhisperContext, WhisperContextParams, WhisperParams, WhisperSamplingStrategy};
+// Alias the crate's engine to avoid colliding with our own `WhisperEngine` struct.
+use transcribe_rs::whisper_cpp::{WhisperEngine as TranscribeWhisper, WhisperInferenceParams};
 
 /// One transcribed word with its timing, used for pacing analysis (fluency.rs).
 pub struct WordTimestamp {
@@ -2328,7 +2415,7 @@ pub struct Transcription {
 }
 
 pub struct WhisperEngine {
-    ctx: WhisperContext,
+    engine: TranscribeWhisper,
 }
 
 impl WhisperEngine {
@@ -2339,10 +2426,9 @@ impl WhisperEngine {
     }
 
     pub fn new(model_path: &Path) -> Result<Self, String> {
-        let params = WhisperContextParams::default();
-        let ctx = WhisperContext::new_with_params(model_path.to_str().unwrap(), params)
+        let engine = TranscribeWhisper::load(model_path)
             .map_err(|e| format!("Failed to load Whisper model at {}: {:?}", model_path.display(), e))?;
-        Ok(Self { ctx })
+        Ok(Self { engine })
     }
 
     pub fn transcribe(&mut self, wav_path: &Path) -> Result<Transcription, String> {
@@ -2363,7 +2449,7 @@ impl WhisperEngine {
         };
 
         // Resample to 16kHz if needed (simple linear interpolation)
-        let samples = if spec.sample_rate != 16000 {
+        let samples: Vec<f32> = if spec.sample_rate != 16000 {
             let ratio = spec.sample_rate as f64 / 16000.0;
             let out_len = (raw_samples.len() as f64 / ratio) as usize;
             (0..out_len)
@@ -2379,43 +2465,43 @@ impl WhisperEngine {
             raw_samples
         };
 
-        let mut state = self.ctx.create_state().map_err(|e| format!("{:?}", e))?;
-        let params = WhisperParams::new(WhisperSamplingStrategy::Greedy { best_of: 1 });
-        state.full(params, &samples).map_err(|e| format!("{:?}", e))?;
+        // transcribe-rs takes the decoded 16kHz mono samples directly.
+        let params = WhisperInferenceParams::default();
+        let result = self
+            .engine
+            .transcribe_with(&samples, &params)
+            .map_err(|e| format!("Whisper inference failed: {e:?}"))?;
 
-        let n = state.full_n_segments().map_err(|e| format!("{:?}", e))?;
-        let mut text = String::new();
+        // Build per-word timestamps from segment-level [start, end] (seconds → ms).
+        // If the engine returned no segments, synthesize one spanning the whole clip
+        // so WPM is still meaningful (pauseCount stays 0).
+        let total_ms = (samples.len() as f64 / 16.0) as u64; // 16 samples per ms at 16kHz
+        let segments: Vec<(String, u64, u64)> = match &result.segments {
+            Some(segs) if !segs.is_empty() => segs
+                .iter()
+                .map(|s| (s.text.clone(), (s.start * 1000.0) as u64, (s.end * 1000.0) as u64))
+                .collect(),
+            _ => vec![(result.text.clone(), 0, total_ms)],
+        };
+
         let mut words: Vec<WordTimestamp> = Vec::new();
-
-        for i in 0..n {
-            let seg_text = state.full_get_segment_text(i).map_err(|e| format!("{:?}", e))?;
-            text.push_str(&seg_text);
-
-            // Segment timestamps are in centiseconds (10ms units) — convert to ms.
-            // If Step 2b found a different unit/accessor, adjust here.
-            let t0_ms = state.full_get_segment_t0(i).map_err(|e| format!("{:?}", e))? as u64 * 10;
-            let t1_ms = state.full_get_segment_t1(i).map_err(|e| format!("{:?}", e))? as u64 * 10;
-
+        for (seg_text, t0_ms, t1_ms) in &segments {
             // Distribute the segment's words evenly across [t0, t1]. The gap to the
             // NEXT segment's t0 is preserved as a pause (fluency.rs reads it).
             let seg_words: Vec<&str> = seg_text.split_whitespace().collect();
             if seg_words.is_empty() {
                 continue;
             }
-            let span = t1_ms.saturating_sub(t0_ms).max(1);
+            let span = t1_ms.saturating_sub(*t0_ms).max(1);
             let per = span / seg_words.len() as u64;
             for (j, w) in seg_words.iter().enumerate() {
                 let ws = t0_ms + per * j as u64;
-                let we = if j + 1 == seg_words.len() { t1_ms } else { ws + per };
-                words.push(WordTimestamp {
-                    word: w.to_string(),
-                    start_ms: ws,
-                    end_ms: we,
-                });
+                let we = if j + 1 == seg_words.len() { *t1_ms } else { ws + per };
+                words.push(WordTimestamp { word: w.to_string(), start_ms: ws, end_ms: we });
             }
         }
 
-        Ok(Transcription { text: text.trim().to_string(), words })
+        Ok(Transcription { text: result.text.trim().to_string(), words })
     }
 }
 
@@ -2454,6 +2540,7 @@ pub fn run() {
             commands::paste_clipboard,
             commands::capture_screenshot,
             commands::play_tts,
+            commands::set_always_on_top,
             commands::start_recording,
             commands::stop_recording,
         ])
@@ -3071,6 +3158,14 @@ describe("FeedbackPanel", () => {
     render(<FeedbackPanel />);
     expect(screen.getByText(/150–170 wpm/)).toBeInTheDocument();
   });
+
+  it("suppresses score + comments when score is null (LLM unreachable)", () => {
+    useAppStore.setState({ feedback: { ...MOCK_FEEDBACK, score: null, comments: [] } } as any);
+    render(<FeedbackPanel />);
+    expect(screen.queryByText("87")).not.toBeInTheDocument();        // no score ring
+    expect(screen.getByText(/AI coach unavailable/i)).toBeInTheDocument();
+    expect(screen.getByText(/142/)).toBeInTheDocument();             // pacing still shown
+  });
 });
 ```
 
@@ -3156,17 +3251,19 @@ export default function FeedbackPanel() {
 
   return (
     <div className="mt-3 pt-3 border-t border-white/[0.06]">
-      {/* Header with score */}
+      {/* Header with score (suppressed when LLM was unreachable) */}
       <div className="flex items-center gap-3 mb-3">
         <p className="text-[10px] font-semibold tracking-widest uppercase text-white/28">
           Feedback
         </p>
-        <div className="ml-auto flex items-center gap-3">
-          <ScoreRing score={feedback.score} />
-          <span className="text-[11px] text-white/30 leading-tight">
-            Fluency<br />Score
-          </span>
-        </div>
+        {feedback.score !== null && (
+          <div className="ml-auto flex items-center gap-3">
+            <ScoreRing score={feedback.score} />
+            <span className="text-[11px] text-white/30 leading-tight">
+              Fluency<br />Score
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Pacing metrics */}
@@ -3182,18 +3279,24 @@ export default function FeedbackPanel() {
         <span className="text-[10px] text-green-300">■ said instead</span>
       </div>
 
-      {/* LLM comments */}
-      <div className="flex flex-col gap-2 mb-4">
-        {feedback.comments.map((c, i) => (
-          <div
-            key={i}
-            className="flex gap-2 items-start p-2.5 rounded-lg bg-indigo-500/[0.06] border border-indigo-500/[0.12] text-[12px] text-white/65 leading-relaxed"
-          >
-            <span className="text-sm flex-shrink-0 mt-0.5">{c.icon}</span>
-            <span dangerouslySetInnerHTML={{ __html: c.text }} />
-          </div>
-        ))}
-      </div>
+      {/* LLM comments (empty when LLM unreachable → show a quiet notice instead) */}
+      {feedback.score === null ? (
+        <p className="text-[11px] text-white/35 italic mb-4">
+          AI coach unavailable — showing content diff and pacing only.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-2 mb-4">
+          {feedback.comments.map((c, i) => (
+            <div
+              key={i}
+              className="flex gap-2 items-start p-2.5 rounded-lg bg-indigo-500/[0.06] border border-indigo-500/[0.12] text-[12px] text-white/65 leading-relaxed"
+            >
+              <span className="text-sm flex-shrink-0 mt-0.5">{c.icon}</span>
+              <span dangerouslySetInnerHTML={{ __html: c.text }} />
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Actions */}
       <div className="flex gap-2">
@@ -3221,7 +3324,7 @@ export default function FeedbackPanel() {
 npx vitest run src/components/__tests__/FeedbackPanel.test.tsx
 ```
 
-Expected: PASS (5 tests).
+Expected: PASS (6 tests).
 
 - [ ] **Step 5: Add FeedbackPanel to `src/App.tsx`**
 
@@ -3377,16 +3480,22 @@ Mapped against the design spec (spec ↔ task):
 - **Screenshot OCR (HTTP only)** → Task 6 (ocr_service) + Task 7 (capture.rs) + Task 8 (CaptureControls) ✓
 - **TTS synthesis sidecar + client-side HTML5 Audio playback/speed/progress** → Task 9 (sidecar) + Task 11 (PlaybackControls) ✓
 - **Mic recording with waveform** → Task 12 (audio.rs) + Task 13 (RecordingPanel) ✓
-- **Whisper STT with word timestamps** → Task 14 (stt.rs, incl. Step 2b transcribe-rs timestamp verification) ✓
+- **Whisper STT with word timestamps** → Task 14 (stt.rs; uses real transcribe-rs `whisper_cpp::WhisperEngine`/`transcribe_with` → `TranscriptionResult.segments`, aliased to avoid name collision; Step 2b confirms the API surface) ✓
 - **Deterministic Rust-owned word-level diff** → Task 15 (diff.rs) ✓
 - **Pacing/fluency metrics (wpm, articulation rate, pauses, hesitations)** → Task 15B (fluency.rs) ✓
 - **LLM returns score + comments ONLY (receives diff + pacing)** → Task 16 (llm.rs) ✓
+- **LLM unreachable → score = None, comments suppressed, diff + pacing still shown** → Task 2 (commands.rs match), Task 2/4 (`score: Option<u32>` / `number | null`), Task 18 (FeedbackPanel suppresses ring + shows "AI coach unavailable") ✓
 - **FeedbackPanel (score ring + pacing readout + diff + comments)** → Task 18 ✓
 - **PacingMetrics type + camelCase serde bridge** → Task 2 (events.rs) + Task 4 (types/index.ts) ✓
 - **Mock mode (VITE_USE_MOCK) incl. pacing** → Task 4 (useMockEvents) ✓
-- **Unique temp paths (screenshot + recording)** → Task 7 (capture.rs) + Task 12 (audio.rs) ✓
+- **audio-level event uses typed helper {level: f32}** → Task 12 calls `crate::events::emit_audio_level` (not a bare `app.emit` — fixes missing-Emitter + payload-shape bug) ✓
+- **Unique temp paths via `tempfile::NamedTempFile` (in [dependencies])** → Task 7 (capture.rs) + Task 12 (audio.rs) — VERIFIED in code, not just claimed ✓
+- **Temp files auto-deleted** → NamedTempFile dropped after OCR (Task 2 capture_screenshot) and after STT (Task 2 stop_recording) ✓
+- **Screenshot hides/restores the app window** → Task 2 (capture_screenshot uses `get_webview_window("main").hide()/show()`) ✓
+- **Always-on-top: window default on + functional toggle** → Task 2 (tauri.conf.json `alwaysOnTop: true` + `set_always_on_top` command) + Task 3 (titlebar toggle wired) ✓
 - **Error toasts for sidecar failures** → CaptureControls + PlaybackControls ✓
 - **Screen Recording permission** → handled via generic addToast in Task 8 ✓
+- **Whisper-model-missing UX** → v1 uses a generic error toast (conscious deviation from the spec's modal; recorded here) ⚠️
 - **azVoiceAssist color theme** → Task 3 (index.css with az-bg, az-accent) ✓
 - **Two-panel resizable layout** → Task 3 (App.tsx with PanelGroup) ✓
 - **Custom titlebar with traffic lights** → Task 3 ✓
