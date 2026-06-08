@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>azReadAnalyzer — Mockup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: #080808;
+      color: #e8e8e8;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Frosted glass effect */
+    .glass {
+      background: rgba(255,255,255,0.04);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .glass-dark {
+      background: rgba(0,0,0,0.3);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+
+    /* Titlebar */
+    .titlebar {
+      background: rgba(15,15,20,0.85);
+      backdrop-filter: blur(30px);
+      border-bottom: 1px solid rgba(255,255,255,0.07);
+      padding: 0 16px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      -webkit-app-region: drag;
+      flex-shrink: 0;
+    }
+    .traffic-lights { display: flex; gap: 6px; -webkit-app-region: no-drag; }
+    .tl { width: 12px; height: 12px; border-radius: 50%; cursor: pointer; }
+    .tl-close { background: #ff5f57; }
+    .tl-min   { background: #febc2e; }
+    .tl-max   { background: #28c840; }
+    .app-title { font-size: 13px; font-weight: 500; color: rgba(255,255,255,0.5); letter-spacing: 0.05em; }
+    .always-on-top {
+      font-size: 11px; color: rgba(255,255,255,0.35);
+      display: flex; align-items: center; gap: 6px;
+      -webkit-app-region: no-drag; cursor: pointer;
+    }
+    .always-on-top:hover { color: rgba(255,255,255,0.6); }
+    .toggle {
+      width: 28px; height: 16px; border-radius: 8px;
+      background: rgba(99,102,241,0.5);
+      position: relative; transition: background 0.2s;
+    }
+    .toggle::after {
+      content: ''; position: absolute;
+      top: 2px; left: 14px; width: 12px; height: 12px;
+      border-radius: 50%; background: white;
+      transition: left 0.2s;
+    }
+
+    /* Main layout */
+    .main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      overflow: hidden;
+      padding: 12px;
+      gap: 10px;
+    }
+
+    /* Panel */
+    .panel {
+      border-radius: 12px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .panel-header {
+      padding: 10px 14px 8px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.3);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      flex-shrink: 0;
+    }
+
+    /* Text input area */
+    .text-area {
+      flex: 1;
+      padding: 14px;
+      font-size: 15px;
+      line-height: 1.7;
+      color: rgba(255,255,255,0.85);
+      background: transparent;
+      border: none;
+      outline: none;
+      resize: none;
+      font-family: 'Inter', sans-serif;
+    }
+    .text-area::placeholder { color: rgba(255,255,255,0.2); }
+
+    /* Capture buttons */
+    .capture-bar {
+      padding: 10px 14px;
+      display: flex;
+      gap: 8px;
+      border-top: 1px solid rgba(255,255,255,0.06);
+      flex-shrink: 0;
+    }
+    .btn {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 12px;
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s;
+    }
+    .btn-ghost {
+      background: rgba(255,255,255,0.06);
+      color: rgba(255,255,255,0.6);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .btn-ghost:hover { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.85); }
+    .btn-primary {
+      background: linear-gradient(135deg, #6366f1, #818cf8);
+      color: white;
+      box-shadow: 0 0 16px rgba(99,102,241,0.3);
+    }
+    .btn-primary:hover { box-shadow: 0 0 24px rgba(99,102,241,0.5); transform: translateY(-1px); }
+    .btn-danger {
+      background: linear-gradient(135deg, #ef4444, #f87171);
+      color: white;
+      box-shadow: 0 0 16px rgba(239,68,68,0.3);
+    }
+    .btn-sm { padding: 4px 10px; font-size: 11px; }
+
+    /* Right panel sections */
+    .right-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      overflow-y: auto;
+    }
+    .section {
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .section-title {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.28);
+      margin-bottom: 10px;
+    }
+
+    /* Playback controls */
+    .playback-row {
+      display: flex; align-items: center; gap: 10px;
+    }
+    .play-btn {
+      width: 40px; height: 40px; border-radius: 50%;
+      background: linear-gradient(135deg, #6366f1, #818cf8);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; border: none;
+      box-shadow: 0 0 20px rgba(99,102,241,0.35);
+      transition: all 0.15s;
+      flex-shrink: 0;
+    }
+    .play-btn:hover { transform: scale(1.08); box-shadow: 0 0 30px rgba(99,102,241,0.5); }
+    .play-btn svg { width: 16px; height: 16px; fill: white; }
+
+    .speed-select {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px;
+      color: rgba(255,255,255,0.7);
+      font-size: 12px;
+      padding: 4px 8px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    /* Progress bar */
+    .progress-track {
+      flex: 1; height: 3px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #6366f1, #818cf8);
+      width: 35%;
+      border-radius: 2px;
+    }
+
+    /* Recording */
+    .record-row {
+      display: flex; align-items: center; gap: 12px;
+    }
+    .record-btn {
+      width: 44px; height: 44px; border-radius: 50%;
+      background: rgba(239,68,68,0.15);
+      border: 2px solid rgba(239,68,68,0.5);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: all 0.15s; flex-shrink: 0;
+    }
+    .record-btn:hover { background: rgba(239,68,68,0.25); border-color: rgba(239,68,68,0.8); }
+    .record-dot { width: 16px; height: 16px; border-radius: 50%; background: #ef4444; }
+    .record-dot.active { animation: pulse-red 1s infinite; }
+    @keyframes pulse-red {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.6; transform: scale(0.85); }
+    }
+
+    /* Waveform */
+    .waveform {
+      flex: 1; height: 36px; display: flex; align-items: center;
+      gap: 2px; padding: 0 4px;
+    }
+    .wave-bar {
+      flex: 1; border-radius: 2px;
+      background: rgba(99,102,241,0.5);
+      animation: wave 0.8s ease-in-out infinite;
+    }
+    @keyframes wave {
+      0%, 100% { transform: scaleY(0.3); }
+      50% { transform: scaleY(1); }
+    }
+    .timer { font-size: 13px; font-weight: 500; color: rgba(255,255,255,0.5); font-variant-numeric: tabular-nums; }
+
+    /* Score */
+    .score-ring {
+      position: relative; width: 64px; height: 64px; flex-shrink: 0;
+    }
+    .score-ring svg { width: 64px; height: 64px; transform: rotate(-90deg); }
+    .score-ring circle { fill: none; stroke-width: 5; }
+    .score-track { stroke: rgba(255,255,255,0.08); }
+    .score-fill {
+      stroke: #6366f1;
+      stroke-dasharray: 163;
+      stroke-dashoffset: 21; /* 87% filled */
+      stroke-linecap: round;
+      filter: drop-shadow(0 0 4px rgba(99,102,241,0.6));
+    }
+    .score-text {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 14px; font-weight: 700; color: #818cf8;
+    }
+
+    /* Diff view */
+    .diff-view {
+      background: rgba(0,0,0,0.25);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      line-height: 1.8;
+      font-family: 'Inter', sans-serif;
+    }
+    .diff-correct { color: rgba(255,255,255,0.85); }
+    .diff-miss { background: rgba(239,68,68,0.2); color: #fca5a5; border-radius: 3px; padding: 0 2px; text-decoration: line-through; }
+    .diff-add  { background: rgba(34,197,94,0.15); color: #86efac; border-radius: 3px; padding: 0 2px; }
+    .diff-skip { background: rgba(251,191,36,0.15); color: #fde68a; border-radius: 3px; padding: 0 2px; }
+
+    /* LLM feedback */
+    .feedback-item {
+      display: flex; gap: 8px; align-items: flex-start;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(99,102,241,0.06);
+      border: 1px solid rgba(99,102,241,0.12);
+      font-size: 12px;
+      color: rgba(255,255,255,0.65);
+      line-height: 1.5;
+    }
+    .feedback-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+    .feedback-list { display: flex; flex-direction: column; gap: 6px; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+    /* Ambient glow */
+    .ambient-left {
+      position: fixed; top: -100px; left: -100px;
+      width: 400px; height: 400px;
+      background: radial-gradient(circle, rgba(99,102,241,0.08) 0%, transparent 70%);
+      pointer-events: none; z-index: 0;
+    }
+    .ambient-right {
+      position: fixed; bottom: -100px; right: -100px;
+      width: 350px; height: 350px;
+      background: radial-gradient(circle, rgba(139,92,246,0.06) 0%, transparent 70%);
+      pointer-events: none; z-index: 0;
+    }
+    .z1 { position: relative; z-index: 1; }
+  </style>
+</head>
+<body>
+
+<div class="ambient-left"></div>
+<div class="ambient-right"></div>
+
+<!-- Titlebar -->
+<div class="titlebar z1">
+  <div class="traffic-lights">
+    <div class="tl tl-close"></div>
+    <div class="tl tl-min"></div>
+    <div class="tl tl-max"></div>
+  </div>
+  <span class="app-title">azReadAnalyzer</span>
+  <div class="always-on-top">
+    <span>Always on top</span>
+    <div class="toggle"></div>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main z1">
+
+  <!-- LEFT: Text Input Panel -->
+  <div class="panel glass">
+    <div class="panel-header">Text Input</div>
+    <textarea class="text-area" placeholder="Paste text or capture a screenshot to begin…">The ability to communicate clearly and confidently in English is one of the most valuable skills you can develop. Whether you're presenting ideas in a meeting, participating in a discussion, or simply having a conversation, the way you express yourself shapes how others perceive your intelligence and competence.</textarea>
+    <div class="capture-bar">
+      <button class="btn btn-ghost">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        Screenshot
+      </button>
+      <button class="btn btn-ghost">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        Paste
+      </button>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        Edit
+      </button>
+    </div>
+  </div>
+
+  <!-- RIGHT: Practice Panel -->
+  <div class="panel glass right-panel">
+
+    <!-- Listen section -->
+    <div class="section">
+      <div class="section-title">Listen</div>
+      <div class="playback-row">
+        <button class="play-btn">
+          <!-- Play icon -->
+          <svg viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21"/></svg>
+        </button>
+        <div class="progress-track">
+          <div class="progress-fill"></div>
+        </div>
+        <span style="font-size:12px;color:rgba(255,255,255,0.35);font-variant-numeric:tabular-nums;">0:14 / 0:42</span>
+        <select class="speed-select">
+          <option>0.75x</option>
+          <option selected>1x</option>
+          <option>1.25x</option>
+          <option>1.5x</option>
+          <option>2x</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Record section -->
+    <div class="section">
+      <div class="section-title">Record Your Reading</div>
+      <div class="record-row">
+        <div class="record-btn">
+          <div class="record-dot active"></div>
+        </div>
+        <div class="waveform">
+          <div class="wave-bar" style="animation-delay:0s;height:60%"></div>
+          <div class="wave-bar" style="animation-delay:0.1s;height:80%"></div>
+          <div class="wave-bar" style="animation-delay:0.2s;height:40%"></div>
+          <div class="wave-bar" style="animation-delay:0.3s;height:100%"></div>
+          <div class="wave-bar" style="animation-delay:0.4s;height:60%"></div>
+          <div class="wave-bar" style="animation-delay:0.5s;height:70%"></div>
+          <div class="wave-bar" style="animation-delay:0.1s;height:50%"></div>
+          <div class="wave-bar" style="animation-delay:0.2s;height:90%"></div>
+          <div class="wave-bar" style="animation-delay:0.3s;height:45%"></div>
+          <div class="wave-bar" style="animation-delay:0.4s;height:75%"></div>
+          <div class="wave-bar" style="animation-delay:0s;height:55%"></div>
+          <div class="wave-bar" style="animation-delay:0.1s;height:85%"></div>
+          <div class="wave-bar" style="animation-delay:0.2s;height:35%"></div>
+          <div class="wave-bar" style="animation-delay:0.3s;height:95%"></div>
+          <div class="wave-bar" style="animation-delay:0.4s;height:65%"></div>
+          <div class="wave-bar" style="animation-delay:0.5s;height:40%"></div>
+          <div class="wave-bar" style="animation-delay:0.1s;height:70%"></div>
+          <div class="wave-bar" style="animation-delay:0.2s;height:50%"></div>
+        </div>
+        <span class="timer">00:23</span>
+        <button class="btn btn-ghost btn-sm">Stop</button>
+      </div>
+    </div>
+
+    <!-- Feedback section -->
+    <div class="section" style="flex:1;overflow-y:auto;">
+      <div style="display:flex;align-items:center;gap:14px;margin-bottom:12px;">
+        <div class="section-title" style="margin-bottom:0;">Feedback</div>
+        <div style="display:flex;align-items:center;gap:10px;margin-left:auto;">
+          <div class="score-ring">
+            <svg viewBox="0 0 64 64">
+              <circle class="score-track" cx="32" cy="32" r="26"/>
+              <circle class="score-fill" cx="32" cy="32" r="26"/>
+            </svg>
+            <div class="score-text">87</div>
+          </div>
+          <div style="font-size:11px;color:rgba(255,255,255,0.3);line-height:1.4;">Fluency<br/>Score</div>
+        </div>
+      </div>
+
+      <!-- Diff view -->
+      <div style="margin-bottom:10px;">
+        <div style="font-size:10px;color:rgba(255,255,255,0.25);margin-bottom:5px;letter-spacing:0.08em;text-transform:uppercase;">What you said vs original</div>
+        <div class="diff-view">
+          <span class="diff-correct">The ability to communicate clearly and </span><span class="diff-miss">confidently</span><span class="diff-add">confident</span><span class="diff-correct"> in English is one of the most valuable skills you can </span><span class="diff-skip">develop</span><span class="diff-correct">. Whether you're </span><span class="diff-miss">presenting</span><span class="diff-add">present</span><span class="diff-correct"> ideas in a meeting…</span>
+        </div>
+        <div style="display:flex;gap:14px;margin-top:6px;">
+          <span style="font-size:10px;color:#fca5a5;">■ missed/wrong</span>
+          <span style="font-size:10px;color:#86efac;">■ what you said</span>
+          <span style="font-size:10px;color:#fde68a;">■ skipped</span>
+        </div>
+      </div>
+
+      <!-- LLM comments -->
+      <div class="feedback-list">
+        <div class="feedback-item">
+          <span class="feedback-icon">🔤</span>
+          <span><strong style="color:rgba(255,255,255,0.8);">"confidently"</strong> — you said "confident" (missing the -ly adverb form). Practice: "speak <em>confidently</em>, act <em>boldly</em>".</span>
+        </div>
+        <div class="feedback-item">
+          <span class="feedback-icon">⏭️</span>
+          <span><strong style="color:rgba(255,255,255,0.8);">"presenting"</strong> — dropped the -ing ending. Slow down before gerunds; they carry tense.</span>
+        </div>
+        <div class="feedback-item">
+          <span class="feedback-icon">✅</span>
+          <span>Good rhythm on the long clause "one of the most valuable skills you can develop" — natural stress and pacing.</span>
+        </div>
+      </div>
+
+      <!-- Re-record -->
+      <div style="margin-top:12px;display:flex;gap:8px;">
+        <button class="btn btn-primary" style="flex:1;">⏺ Re-record</button>
+        <button class="btn btn-ghost">New Text</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>
