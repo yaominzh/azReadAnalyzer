@@ -1,0 +1,9 @@
+node_modules/
+dist/
+src-tauri/target/
+.DS_Store
+*.log
+/tmp/az_*.wav
+/tmp/az_*.png
+ocr_service/.venv/
+tts_service/.venv/
