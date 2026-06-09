@@ -1,0 +1,4 @@
+fastapi==0.115.0
+uvicorn==0.32.0
+pyobjc-framework-Vision==11.0
+pyobjc-framework-Quartz==11.0
