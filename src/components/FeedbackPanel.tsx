@@ -2,12 +2,26 @@ import { useAppStore } from "../store/useAppStore";
 import type { DiffToken, PacingMetrics } from "../types";
 
 function PacingReadout({ pacing }: { pacing: PacingMetrics }) {
+  // Honesty guardrail: WPM is always valid; pause/hesitation metrics are only
+  // meaningful when ASR produced ≥2 segments. When not, show "—" and a note
+  // rather than an authoritative (and possibly wrong) "0 pauses".
+  const reliable = pacing.pausesReliable;
+  const dash = (n: string | number) =>
+    reliable ? <span className="text-indigo-300 font-medium">{n}</span> : <span className="text-white/30">—</span>;
+
   return (
-    <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-[12px] text-white/55">
-      <span><span className="text-indigo-300 font-medium">{Math.round(pacing.wordsPerMinute)}</span> wpm</span>
-      <span><span className="text-indigo-300 font-medium">{pacing.pauseCount}</span> pauses</span>
-      <span><span className="text-indigo-300 font-medium">{pacing.longHesitations}</span> long hesitations</span>
-      <span><span className="text-indigo-300 font-medium">{Math.round(pacing.pauseRatio * 100)}%</span> pause ratio</span>
+    <div className="mb-3">
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-white/55">
+        <span><span className="text-indigo-300 font-medium">{Math.round(pacing.wordsPerMinute)}</span> wpm</span>
+        <span>{dash(pacing.pauseCount)} pauses</span>
+        <span>{dash(pacing.longHesitations)} long hesitations</span>
+        <span>{dash(`${Math.round(pacing.pauseRatio * 100)}%`)} pause ratio</span>
+      </div>
+      {!reliable && (
+        <p className="mt-1 text-[10px] text-white/30 italic">
+          Limited timing data — pause/hesitation metrics need a longer reading.
+        </p>
+      )}
     </div>
   );
 }

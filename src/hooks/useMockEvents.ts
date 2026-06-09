@@ -37,6 +37,7 @@ export function useMockEvents() {
             totalPauseMs: 4200,
             pauseRatio: 0.21,
             longHesitations: 2,
+            pausesReliable: true,
           },
           comments: [
             { icon: "🐢", text: "Your pace (142 wpm) is on the slow side for read-aloud — aim for 150–170." },

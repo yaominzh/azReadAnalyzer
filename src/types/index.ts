@@ -25,6 +25,9 @@ export interface PacingMetrics {
   totalPauseMs: number;
   pauseRatio: number;
   longHesitations: number;
+  // false when ASR gave <2 segments → pause/hesitation values are not
+  // measurable and the UI shows "—" + a "limited timing data" note instead.
+  pausesReliable: boolean;
 }
 
 // Full feedback result

@@ -19,6 +19,7 @@ const MOCK_FEEDBACK: FeedbackResult = {
     totalPauseMs: 4200,
     pauseRatio: 0.21,
     longHesitations: 2,
+    pausesReliable: true,
   },
   comments: [{ icon: "🐢", text: "Aim for 150–170 wpm." }],
 };
@@ -54,6 +55,15 @@ describe("FeedbackPanel", () => {
     useAppStore.setState({ feedback: MOCK_FEEDBACK });
     render(<FeedbackPanel />);
     expect(screen.getByText(/150–170 wpm/)).toBeInTheDocument();
+  });
+
+  it("de-emphasizes pause metrics when pausesReliable is false", () => {
+    useAppStore.setState({
+      feedback: { ...MOCK_FEEDBACK, pacing: { ...MOCK_FEEDBACK.pacing, pausesReliable: false } },
+    });
+    render(<FeedbackPanel />);
+    expect(screen.getByText(/limited timing data/i)).toBeInTheDocument();
+    expect(screen.getByText(/142/)).toBeInTheDocument(); // wpm still shown
   });
 
   it("suppresses score + comments when score is null (LLM unreachable)", () => {

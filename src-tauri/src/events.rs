@@ -38,6 +38,12 @@ pub struct PacingMetrics {
     pub total_pause_ms: u32,
     pub pause_ratio: f32,
     pub long_hesitations: u32,
+    // Honesty guardrail (PM Iteration-2 P1): pause/hesitation metrics are only
+    // observable at segment boundaries (transcribe-rs gives segment-level
+    // timestamps). With <2 segments we cannot measure pauses, so the UI must
+    // not present an authoritative "0 pauses". false => show "—" / "limited
+    // timing data" for pause/hesitation fields; wpm stays valid regardless.
+    pub pauses_reliable: bool,
 }
 
 #[derive(Serialize, Clone)]

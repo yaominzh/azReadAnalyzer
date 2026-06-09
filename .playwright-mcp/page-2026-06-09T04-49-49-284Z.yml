@@ -1,0 +1,35 @@
+- generic [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e9]: azReadAnalyzer
+    - button "Always on top" [ref=e10]:
+      - generic [ref=e11]: Always on top
+  - generic [ref=e15]:
+    - generic [ref=e18]:
+      - paragraph [ref=e19]: Text Input
+      - generic [ref=e20]:
+        - textbox "Paste text or capture a screenshot to begin…" [ref=e21]
+        - generic [ref=e22]:
+          - button "Screenshot" [ref=e23]
+          - button "Paste" [ref=e24]
+          - button "Clear" [ref=e25]
+    - separator [ref=e26]
+    - generic [ref=e29]:
+      - paragraph [ref=e30]: Practice
+      - generic [ref=e31]:
+        - generic [ref=e32]:
+          - paragraph [ref=e33]: Listen
+          - generic [ref=e34]:
+            - button "Play" [disabled] [ref=e35]:
+              - img [ref=e36]
+            - generic [ref=e39]: 0:00 / 0:00
+            - combobox "Playback speed" [ref=e40] [cursor=pointer]:
+              - option "0.75x"
+              - option "1x" [selected]
+              - option "1.25x"
+              - option "1.5x"
+              - option "2x"
+        - generic [ref=e41]:
+          - paragraph [ref=e42]: Record Your Reading
+          - generic [ref=e43]:
+            - button "Record" [disabled] [ref=e44]
+            - generic [ref=e67]: 00:00

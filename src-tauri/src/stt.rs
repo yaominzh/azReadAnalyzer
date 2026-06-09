@@ -25,6 +25,9 @@ pub struct WordTimestamp {
 pub struct Transcription {
     pub text: String,
     pub words: Vec<WordTimestamp>,
+    /// Number of real ASR segments. Pause detection is only observable across
+    /// segment boundaries, so fluency.rs uses this to flag pause reliability.
+    pub segment_count: usize,
 }
 
 pub struct WhisperEngine {
@@ -79,6 +82,10 @@ impl WhisperEngine {
         // If the engine returned no segments, synthesize one spanning the whole clip
         // so WPM is still meaningful (pauseCount stays 0).
         let total_ms = (samples.len() as u64) * 1000 / WHISPER_SAMPLE_RATE as u64;
+        let segment_count = match &result.segments {
+            Some(segs) if !segs.is_empty() => segs.len(),
+            _ => 1, // synthetic single segment — not a real measured boundary
+        };
         let segments: Vec<(String, u64, u64)> = match &result.segments {
             Some(segs) if !segs.is_empty() => segs
                 .iter()
@@ -108,7 +115,7 @@ impl WhisperEngine {
             }
         }
 
-        Ok(Transcription { text: result.text.trim().to_string(), words })
+        Ok(Transcription { text: result.text.trim().to_string(), words, segment_count })
     }
 }
 

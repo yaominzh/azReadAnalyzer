@@ -2,16 +2,30 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project status: pre-implementation
+## Project status: MVP built (Tier-B hardened)
 
-This repo is **greenfield**. Only design docs and a UI mockup exist today — there is no `src/`, `src-tauri/`, or sidecar code yet. The application is built by **executing the implementation plan task-by-task**, not by free-form coding.
+The v1 MVP is implemented across the full stack: `src/` (React frontend) and `src-tauri/src/` (Rust backend) exist and compile. Built in 3 iterations with a PM review after each (see [docs/pmreview/](docs/pmreview/)).
 
+**Machine-verified:** `cargo build` links the app binary; `cargo test --lib` (15 pass, 1 ignored — the OCR test needs a live sidecar); frontend `vitest` (20 pass), `tsc`, `eslint`, `vite build` all clean; the full Practice/Feedback UI renders correctly in mock mode (`VITE_USE_MOCK=true npx vite`).
+
+**NOT machine-verifiable here (needs the user's hardware/services):** a real mic→TTS→LLM round-trip. That requires Microphone + Screen-Recording permissions, the `ggml-base.en.bin` model, both Python sidecars running, and a local OpenAI-compatible LLM. The Rust pipeline (`stop_recording` → STT → diff → fluency → LLM → `feedback-ready`) is wired and unit-tested per stage, but the live end-to-end pass must be run on the target Mac.
+
+**Source-of-truth docs:**
 - [docs/superpowers/specs/2026-06-07-azreadanalyzer-design.md](docs/superpowers/specs/2026-06-07-azreadanalyzer-design.md) — authoritative design spec (architecture, IPC contract, state shapes, feedback methodology).
-- [docs/superpowers/plans/2026-06-07-azreadanalyzer-implementation.md](docs/superpowers/plans/2026-06-07-azreadanalyzer-implementation.md) — the 19-task plan (5 sub-projects). Every file, code block, and test is specified here. Use the `superpowers:subagent-driven-development` or `superpowers:executing-plans` skill to work through it; check off `- [ ]` steps as you go.
-- [docs/thirdpartyreview/](docs/thirdpartyreview/) — independent reviews of the spec and plan. Read these before changing core decisions — they document *why* the design landed where it did.
-- [mockup.html](mockup.html) — static visual reference for the target UI.
+- [docs/superpowers/specs/2026-06-08-azreadanalyzer-tierb-hardening.md](docs/superpowers/specs/2026-06-08-azreadanalyzer-tierb-hardening.md) — the Tier-B runtime-robustness hardening applied in this build (B1/B2/B3).
+- [docs/superpowers/plans/2026-06-07-azreadanalyzer-implementation.md](docs/superpowers/plans/2026-06-07-azreadanalyzer-implementation.md) — the 19-task plan the build followed.
+- [docs/pmreview/](docs/pmreview/) — per-iteration PM reviews and the engineering responses carried forward.
+- [docs/thirdpartyreview/](docs/thirdpartyreview/) — independent reviews of the spec and plan; document *why* the design landed where it did.
 
-When implementing, the plan is the source of truth for *what to type*; the spec is the source of truth for *why*. If they conflict, prefer the spec and flag it.
+**Deviations from the original plan, applied during the build (all in commit history + PM reviews):**
+- `react-resizable-panels` v4 API is `Group`/`Panel`/`Separator` (the plan used the v2 `PanelGroup`/`PanelResizeHandle` names).
+- Bundle icons were generated with `npx tauri icon` (the plan referenced an `icons/` dir it never created → `generate_context!` failed without them).
+- Added `eslint.config.js` (flat config; the plan listed the deps but never created the file).
+- B-hardening folded in: B1 (`play_tts` → `tauri::ipc::Response`), B2 (LLM timeout via `OMLX_TIMEOUT_SECS` + tolerant JSON extraction), B3 (cpal sample-format branching + `rubato` resampling).
+- Honesty guardrail (PM Iteration-2 P1): `PacingMetrics.pausesReliable` (`false` when ASR yields <2 segments) → the UI shows "—" + "limited timing data" for pause/hesitation instead of an authoritative "0 pauses".
+- `FeedbackPanel` renders LLM comment text as plain text, not `dangerouslySetInnerHTML`.
+
+When extending, the plan is the source of truth for *intent*; the spec is the source of truth for *why*. If they conflict, prefer the spec and flag it.
 
 ## What the app is
 

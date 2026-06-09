@@ -99,7 +99,7 @@ pub async fn stop_recording(
     };
 
     let diff = crate::diff::word_diff(&original_text, &result.text);
-    let pacing = crate::fluency::compute_pacing(&result.words);
+    let pacing = crate::fluency::compute_pacing(&result.words, result.segment_count);
 
     // LLM is best-effort. If it's unreachable, score = None and comments = [];
     // the UI still shows the locally-computed diff + pacing.

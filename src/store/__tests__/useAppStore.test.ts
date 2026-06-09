@@ -3,7 +3,7 @@ import { useAppStore } from "../useAppStore";
 
 const ZERO_PACING = {
   wordsPerMinute: 0, articulationRate: 0, pauseCount: 0,
-  totalPauseMs: 0, pauseRatio: 0, longHesitations: 0,
+  totalPauseMs: 0, pauseRatio: 0, longHesitations: 0, pausesReliable: false,
 };
 
 describe("useAppStore", () => {
