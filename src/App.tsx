@@ -3,6 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import TextInputPanel from "./components/TextInputPanel";
 import CaptureControls from "./components/CaptureControls";
+import PlaybackControls from "./components/PlaybackControls";
+import RecordingPanel from "./components/RecordingPanel";
+import FeedbackPanel from "./components/FeedbackPanel";
 import Toasts from "./components/Toasts";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useMockEvents } from "./hooks/useMockEvents";
@@ -64,7 +67,9 @@ export default function App() {
                 Practice
               </p>
               <div className="p-3.5 flex flex-col gap-0 overflow-y-auto flex-1">
-                {/* PlaybackControls + RecordingPanel + FeedbackPanel go here (iterations 2-3) */}
+                <PlaybackControls />
+                <RecordingPanel />
+                <FeedbackPanel />
               </div>
             </div>
           </Panel>
