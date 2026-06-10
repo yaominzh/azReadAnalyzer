@@ -7,6 +7,9 @@ use crate::stt::WhisperEngine;
 pub struct AppState {
     pub recorder: Mutex<Option<Recorder>>,
     pub stt_engine: Mutex<Option<WhisperEngine>>,
+    // Session-only copy of the last recording's WAV bytes, for replay (#3).
+    // In-memory only; overwritten each recording; dropped on quit.
+    pub last_recording_wav: Mutex<Option<Vec<u8>>>,
 }
 
 // SAFETY: Recorder holds cpal::Stream which is not Send, but access is
@@ -56,6 +59,17 @@ pub async fn play_tts(text: String) -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Returns the last recording's WAV bytes for replay (#3), via the same
+/// raw-bytes `ipc::Response` pattern as `play_tts`. Err when nothing is stored.
+#[command]
+pub fn get_last_recording(state: State<'_, Arc<AppState>>) -> Result<tauri::ipc::Response, String> {
+    let g = state.last_recording_wav.lock().map_err(|e| e.to_string())?;
+    match &*g {
+        Some(bytes) => Ok(tauri::ipc::Response::new(bytes.clone())),
+        None => Err("No recording yet".into()),
+    }
+}
+
 #[command]
 pub fn set_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri::Manager;
@@ -97,6 +111,15 @@ pub async fn stop_recording(
         let engine = eng.as_mut().ok_or("Whisper not loaded")?;
         engine.transcribe(wav.path())?
     };
+
+    // Keep an in-memory copy of the recording for replay (#3), captured right
+    // after STT and before the LLM await — so it's saved even if the LLM is
+    // slow/cancelled, and the lock is never held across `.await`. (TPM M1)
+    if let Ok(bytes) = std::fs::read(wav.path()) {
+        if let Ok(mut g) = state.last_recording_wav.lock() {
+            *g = Some(bytes);
+        }
+    }
 
     let diff = crate::diff::word_diff(&original_text, &result.text);
     let pacing = crate::fluency::compute_pacing(&result.words, result.segment_count);

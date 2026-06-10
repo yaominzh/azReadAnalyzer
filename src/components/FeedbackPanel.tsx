@@ -1,5 +1,62 @@
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/useAppStore";
 import type { DiffToken, PacingMetrics } from "../types";
+
+// Replay the user's own recording (#3). Fetches the WAV via get_last_recording
+// (raw bytes / ipc::Response) and plays it with HTML5 Audio. Object URLs are
+// revoked on replace / end / unmount to avoid leaks (review #5 lifecycle rule).
+function ReplayYourReading() {
+  const addToast = useAppStore((s) => s.addToast);
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const urlRef = useRef<string | null>(null);
+
+  function cleanup() {
+    audioRef.current?.pause();
+    audioRef.current = null;
+    if (urlRef.current) {
+      URL.revokeObjectURL(urlRef.current);
+      urlRef.current = null;
+    }
+  }
+
+  // Revoke on unmount.
+  useEffect(() => cleanup, []);
+
+  async function handleClick() {
+    if (playing) {
+      cleanup();
+      setPlaying(false);
+      return;
+    }
+    try {
+      const buf = await invoke<ArrayBuffer>("get_last_recording");
+      cleanup(); // revoke any prior audio/URL before starting a new one (TPM S3)
+      const url = URL.createObjectURL(new Blob([new Uint8Array(buf)], { type: "audio/wav" }));
+      urlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => { cleanup(); setPlaying(false); };
+      await audio.play();
+      setPlaying(true);
+    } catch (e) {
+      cleanup();
+      setPlaying(false);
+      addToast(String(e), "error");
+    }
+  }
+
+  return (
+    <button
+      onClick={handleClick}
+      className="flex items-center gap-1.5 text-[11px] font-medium text-white/55 bg-white/[0.06] border border-white/10 rounded-lg px-2.5 py-1 hover:bg-white/[0.1] hover:text-white/80 transition-colors"
+    >
+      <span aria-hidden>{playing ? "⏸" : "▶"}</span>
+      <span>Your reading</span>
+    </button>
+  );
+}
 
 function PacingReadout({ pacing }: { pacing: PacingMetrics }) {
   // Honesty guardrail: WPM is always valid; pause/hesitation metrics are only
@@ -88,6 +145,8 @@ export default function FeedbackPanel() {
         <p className="text-[10px] font-semibold tracking-widest uppercase text-white/28">
           Feedback
         </p>
+        {/* Replay the user's own recording (#3) */}
+        <ReplayYourReading />
         {feedback.score !== null && (
           <div className="ml-auto flex items-center gap-3">
             <ScoreRing score={feedback.score} />
