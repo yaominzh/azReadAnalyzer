@@ -10,6 +10,10 @@ pub struct AppState {
     // Session-only copy of the last recording's WAV bytes, for replay (#3).
     // In-memory only; overwritten each recording; dropped on quit.
     pub last_recording_wav: Mutex<Option<Vec<u8>>>,
+    // Session-only copy of the last captured image PNG (screenshot or pasted
+    // image), for the thumbnail/lightbox (#4). Authoritative for "is there a
+    // thumbnail"; cleared on text-only paste / clear / capture failure.
+    pub last_capture_png: Mutex<Option<Vec<u8>>>,
 }
 
 // SAFETY: Recorder holds cpal::Stream which is not Send, but access is
@@ -17,13 +21,57 @@ pub struct AppState {
 unsafe impl Send for AppState {}
 unsafe impl Sync for AppState {}
 
-#[command]
-pub fn paste_clipboard() -> Result<String, String> {
-    crate::clipboard::read_text()
+/// Result of a paste: reading text, plus whether an image thumbnail was captured (#4).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteResult {
+    pub text: String,
+    pub has_image: bool,
 }
 
 #[command]
-pub async fn capture_screenshot(app: AppHandle) -> Result<(), String> {
+pub async fn paste_clipboard(state: State<'_, Arc<AppState>>) -> Result<PasteResult, String> {
+    // Text-first precedence (review #4): a clipboard carrying both text and
+    // image flavors is treated as text-only.
+    if let Ok(text) = crate::clipboard::read_text() {
+        if !text.trim().is_empty() {
+            if let Ok(mut g) = state.last_capture_png.lock() {
+                *g = None;
+            }
+            return Ok(PasteResult { text, has_image: false });
+        }
+    }
+
+    // No text → try an image: encode to PNG, OCR it, keep the PNG for the thumbnail.
+    // Clear up-front so ANY early error below (temp/write/OCR) cannot leave a
+    // stale capture image — spec error table requires "last_capture_png cleared"
+    // on capture/OCR failure (QA D1). Only set it on full success.
+    if let Ok(mut g) = state.last_capture_png.lock() {
+        *g = None;
+    }
+    match crate::clipboard::read_image_png() {
+        Ok(png) => {
+            let temp = tempfile::Builder::new()
+                .prefix("az_paste_")
+                .suffix(".png")
+                .tempfile()
+                .map_err(|e| format!("temp file: {e}"))?;
+            std::fs::write(temp.path(), &png).map_err(|e| e.to_string())?;
+            let text = crate::capture::call_ocr_sidecar(temp.path()).await?;
+            if let Ok(mut g) = state.last_capture_png.lock() {
+                *g = Some(png);
+            }
+            Ok(PasteResult { text, has_image: true })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[command]
+pub async fn capture_screenshot(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     use tauri::Manager;
     let window = app.get_webview_window("main");
 
@@ -32,11 +80,14 @@ pub async fn capture_screenshot(app: AppHandle) -> Result<(), String> {
         w.hide().ok();
     }
 
-    // Run capture + OCR, always restoring the window afterward.
+    // Run capture + OCR, always restoring the window afterward. Also read the
+    // PNG bytes before the temp file drops, to keep them for the thumbnail (#4).
     let outcome = async {
         // `temp` is a NamedTempFile (unique path); dropped at end of this block → auto-deleted.
         let temp = crate::capture::capture_screen_region().await?;
-        crate::capture::call_ocr_sidecar(temp.path()).await
+        let text = crate::capture::call_ocr_sidecar(temp.path()).await?;
+        let png = std::fs::read(temp.path()).ok();
+        Ok::<(String, Option<Vec<u8>>), String>((text, png))
     }
     .await;
 
@@ -45,8 +96,11 @@ pub async fn capture_screenshot(app: AppHandle) -> Result<(), String> {
         w.set_focus().ok();
     }
 
-    let text = outcome?;
-    crate::events::emit_text_captured(&app, text);
+    let (text, png) = outcome?;
+    if let Ok(mut g) = state.last_capture_png.lock() {
+        *g = png;
+    }
+    crate::events::emit_text_captured(&app, text, true);
     Ok(())
 }
 
@@ -68,6 +122,27 @@ pub fn get_last_recording(state: State<'_, Arc<AppState>>) -> Result<tauri::ipc:
         Some(bytes) => Ok(tauri::ipc::Response::new(bytes.clone())),
         None => Err("No recording yet".into()),
     }
+}
+
+/// Returns the last captured image PNG bytes for the thumbnail/lightbox (#4).
+#[command]
+pub fn get_capture_image(state: State<'_, Arc<AppState>>) -> Result<tauri::ipc::Response, String> {
+    let g = state.last_capture_png.lock().map_err(|e| e.to_string())?;
+    match &*g {
+        Some(bytes) => Ok(tauri::ipc::Response::new(bytes.clone())),
+        None => Err("No capture image".into()),
+    }
+}
+
+/// Clears the session capture image (#4). Scoped to `last_capture_png` ONLY —
+/// NOT `last_recording_wav` (New Text calls this; dropping the recording would
+/// hide the replay control mid-session). (TPM S6)
+#[command]
+pub fn clear_session_media(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if let Ok(mut g) = state.last_capture_png.lock() {
+        *g = None;
+    }
+    Ok(())
 }
 
 #[command]

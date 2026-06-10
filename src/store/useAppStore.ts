@@ -13,6 +13,9 @@ interface AppStore {
   recordingTimer: number;
   // Feedback
   feedback: FeedbackResult | null;
+  // Captured image thumbnail (#4) — object URL (real) or data URL (mock).
+  // The store is the single owner; setter revokes the previous URL.
+  captureImageUrl: string | null;
   // Toasts
   toasts: Toast[];
 
@@ -25,6 +28,8 @@ interface AppStore {
   setRecordingTimer(seconds: number): void;
   setFeedback(result: FeedbackResult): void;
   clearFeedback(): void;
+  setCaptureImageUrl(url: string): void;
+  clearCaptureImage(): void;
   addToast(message: string, type: "error" | "info"): void;
   removeToast(id: string): void;
 }
@@ -37,6 +42,7 @@ const INITIAL_STATE = {
   audioLevel: 0,
   recordingTimer: 0,
   feedback: null,
+  captureImageUrl: null,
   toasts: [],
 };
 
@@ -51,6 +57,19 @@ export const useAppStore = create<AppStore>()((set) => ({
   setRecordingTimer: (recordingTimer) => set({ recordingTimer }),
   setFeedback: (feedback) => set({ feedback }),
   clearFeedback: () => set({ feedback: null }),
+  // Single-owner object-URL lifecycle: revoke the previous URL before replacing
+  // / clearing so blob URLs don't leak (review #5). Revoking a data: URL (mock)
+  // is a harmless no-op.
+  setCaptureImageUrl: (url) =>
+    set((s) => {
+      if (s.captureImageUrl) URL.revokeObjectURL(s.captureImageUrl);
+      return { captureImageUrl: url };
+    }),
+  clearCaptureImage: () =>
+    set((s) => {
+      if (s.captureImageUrl) URL.revokeObjectURL(s.captureImageUrl);
+      return { captureImageUrl: null };
+    }),
   addToast: (message, type) =>
     set((s) => ({
       toasts: [...s.toasts, { id: crypto.randomUUID(), message, type }],

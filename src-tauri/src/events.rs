@@ -2,8 +2,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct TextCapturedPayload {
     pub text: String,
+    pub has_image: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -58,8 +60,8 @@ pub struct FeedbackReadyPayload {
     pub comments: Vec<LlmComment>,
 }
 
-pub fn emit_text_captured(app: &AppHandle, text: String) {
-    app.emit("text-captured", TextCapturedPayload { text }).ok();
+pub fn emit_text_captured(app: &AppHandle, text: String, has_image: bool) {
+    app.emit("text-captured", TextCapturedPayload { text, has_image }).ok();
 }
 
 pub fn emit_audio_level(app: &AppHandle, level: f32) {

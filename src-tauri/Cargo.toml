@@ -30,6 +30,8 @@ rubato = "0.16.2"
 
 # Clipboard
 arboard = "3"
+# Encode clipboard RGBA images to PNG for OCR + thumbnail (#4).
+image = "0.25"
 
 # Diff
 similar = "2"

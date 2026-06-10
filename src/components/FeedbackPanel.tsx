@@ -135,6 +135,14 @@ export default function FeedbackPanel() {
   const feedback = useAppStore((s) => s.feedback);
   const clearFeedback = useAppStore((s) => s.clearFeedback);
   const setInputText = useAppStore((s) => s.setInputText);
+  const clearCaptureImage = useAppStore((s) => s.clearCaptureImage);
+
+  function handleNewText() {
+    clearFeedback();
+    setInputText("");
+    clearCaptureImage();
+    invoke("clear_session_media").catch(() => {});
+  }
 
   if (!feedback) return null;
 
@@ -200,7 +208,7 @@ export default function FeedbackPanel() {
           ⏺ Re-record
         </button>
         <button
-          onClick={() => { clearFeedback(); setInputText(""); }}
+          onClick={handleNewText}
           className="px-4 py-2 rounded-lg text-[12px] font-medium bg-white/[0.06] border border-white/[0.08] text-white/60 hover:bg-white/10 hover:text-white/85 transition-all"
         >
           New Text

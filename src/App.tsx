@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import TextInputPanel from "./components/TextInputPanel";
+import CaptureThumbnail from "./components/CaptureThumbnail";
 import CaptureControls from "./components/CaptureControls";
 import PlaybackControls from "./components/PlaybackControls";
 import RecordingPanel from "./components/RecordingPanel";
@@ -93,6 +94,7 @@ export default function App() {
               </p>
               <div className="flex-1 p-4 flex flex-col min-h-0">
                 <TextInputPanel />
+                <CaptureThumbnail />
                 <CaptureControls />
               </div>
             </div>

@@ -33,4 +33,14 @@ describe("useAppStore", () => {
     useAppStore.getState().clearFeedback();
     expect(useAppStore.getState().feedback).toBeNull();
   });
+
+  it("setCaptureImageUrl sets the url and clearCaptureImage nulls it", () => {
+    useAppStore.getState().setCaptureImageUrl("blob:one");
+    expect(useAppStore.getState().captureImageUrl).toBe("blob:one");
+    // replacing revokes the previous and sets the new
+    useAppStore.getState().setCaptureImageUrl("blob:two");
+    expect(useAppStore.getState().captureImageUrl).toBe("blob:two");
+    useAppStore.getState().clearCaptureImage();
+    expect(useAppStore.getState().captureImageUrl).toBeNull();
+  });
 });

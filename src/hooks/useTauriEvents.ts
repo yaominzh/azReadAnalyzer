@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../store/useAppStore";
+import { loadCaptureImage } from "../lib/loadCaptureImage";
 import type {
   TextCapturedPayload,
   AudioLevelPayload,
@@ -23,6 +24,8 @@ export function useTauriEvents() {
 
       const u1 = await listen<TextCapturedPayload>("text-captured", (e) => {
         store.setInputText(e.payload.text);
+        if (e.payload.hasImage) loadCaptureImage();
+        else store.clearCaptureImage();
       });
 
       const u2 = await listen<AudioLevelPayload>("audio-level", (e) => {
