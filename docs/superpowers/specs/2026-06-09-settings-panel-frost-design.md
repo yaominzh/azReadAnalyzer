@@ -5,6 +5,9 @@
 **Branch:** `260609-bugfix` (follows the UI-feedback round-1 work)
 **Builds on:** [2026-06-09-ui-feedback-round1-design.md](2026-06-09-ui-feedback-round1-design.md) (frost was introduced there, #2)
 **Reference:** azVoiceAssist transparency system — `/Users/allen/repo/azVoiceAssist/docs/archi/03-tauri-gui-target.md` (§Transparency system, §Settings panel)
+**Review incorporated:** [2026-06-10-settings-panel-frost-design-review.md](../thirdpartyreview/2026-06-10-settings-panel-frost-design-review.md) (Codex) — findings 1–7 evaluated/verified and applied (finding 1 as **warn-and-allow** per user decision, not hard-reject).
+
+> **Privacy note:** the app's "100% on-device" guarantee holds for the default loopback oMLX. Allowing a user-set **non-loopback** endpoint (with an explicit off-device warning + confirm) is a deliberate, user-chosen exception — the reading text is sent to whatever host they configure. The guarantee is the default and the safe path, not an absolute lock.
 
 ---
 
@@ -24,7 +27,7 @@ By the end of this round:
 
 1. **The frost renders cleanly and consistently.** One variable-driven frost layer (not stacked translucency), with sensible defaults. *Success:* the window reads as deliberate frosted glass, not flat dark; verified live.
 2. **Appearance is tunable at runtime.** A gear button opens a Settings panel; the Appearance section offers frost **presets** (Solid / Frosted / Glass) plus **advanced** opacity + blur sliders with live preview, persisted across restarts. *Success:* changing a preset/slider updates the window instantly and survives a relaunch.
-3. **The Settings panel is extensible and backed by Rust.** A general panel (sections), with a **Connection** section editing LLM settings persisted to a Rust `settings.json`, mirroring azVoiceAssist's `get_settings` / `apply_settings` / `SettingsChanged` pattern. *Success:* setting base URL / model / key / timeout in the UI persists and is used by the next analysis — no env var needed.
+3. **The Settings panel is extensible and backed by Rust.** A general panel (sections), with a **Connection** section editing LLM settings persisted to a Rust `settings.json`, mirroring azVoiceAssist's `get_settings` / `apply_settings` commands (review #5: **no `SettingsChanged` event** — azReadAnalyzer has no long-lived worker thread to notify; the next `stop_recording` reads the updated `AppState.settings`). *Success:* setting base URL / model / key / timeout in the UI persists and is used by the next analysis — no env var needed.
 
 **Non-goals:** native macOS vibrancy material (we use the CSS approach per azVoiceAssist); per-panel independent frost; theming/accent colors; settings beyond Appearance + Connection (e.g. Whisper model path, TTS speed default) — the panel is *structured* to grow but those are out of scope now.
 
@@ -65,11 +68,14 @@ Mirror azVoiceAssist's three-layer model.
 
 ### Section 2 — Connection (Rust-backed, settings.json)
 Edits the LLM/oMLX config currently supplied via env vars:
-- **Base URL** (text, default `http://127.0.0.1:8002/v1`)
+- **oMLX Base URL** (text, default `http://127.0.0.1:8002/v1`). **(review #1 — privacy)** The app's guarantee is on-device *by default*; this field defaults to loopback. If the user enters a **non-loopback** host (not `127.0.0.1` / `localhost` / `::1`), the panel shows a clear inline warning — "this sends your reading text off this machine" — and requires explicit confirmation, but **allows** it (the user's documented setup includes a remote/LAN oMLX). So: warn-and-allow, not hard-reject.
+- **(review #3 — normalization)** On Apply, the URL is normalized: trim whitespace, strip trailing slash(es), require an `http`/`https` scheme, and treat the stored value as the API **base** (ending at `/v1`) — `llm.rs` appends `/chat/completions`. Reject (toast) a value with no scheme or that isn't parseable.
 - **Model** (text, default `default`)
 - **API key** (password field, default empty)
 - **Timeout (s)** (number 5–300, default 45)
-- **Apply** validates + saves to `settings.json` via `apply_settings` and updates the in-memory config used by the next analysis. **Defaults** / **Cancel** as in azVoiceAssist.
+- **Apply** validates + persists (see ordering below) and the new config is used by the next analysis.
+- **(review #6) Defaults** = **built-in reset** (not env): `http://127.0.0.1:8002/v1`, model `default`, empty key, timeout `45`. (Predictable + privacy-safe; doesn't silently re-pull whatever env the app was launched with.)
+- **(review #2) Cancel** = close the panel and **discard unsaved Connection form edits**. It does NOT revert Appearance — those are live and already persisted (see below). Connection edits only take effect on Apply.
 
 ## Persistence architecture (the azVoiceAssist split)
 
@@ -90,7 +96,7 @@ pub struct AppSettings {
 }
 ```
 - `Default` pulls each field from the matching env var (`OMLX_BASE_URL` / `OMLX_MODEL` / `OMLX_API_KEY` / `OMLX_TIMEOUT_SECS`) when present, else the built-in default — so the current env-var launch keeps working, and the UI can override.
-- `load()` reads `~/.azreadanalyzer/settings.json`, falling back to `Default` on absent/parse-error. `save()` writes it (pretty JSON). Validation: non-empty base URL, timeout in 5–300.
+- `load()` reads `~/.azreadanalyzer/settings.json`, falling back to `Default` on absent/parse-error. `save()` writes it (pretty JSON). Validation (review #3): base URL trimmed, trailing slashes stripped, parseable with an `http`/`https` scheme; timeout in 5–300. Non-loopback host is allowed but the *frontend* surfaces the off-device warning (review #1) — the backend does not block it.
 - **Managed state:** `AppState` gains `settings: Mutex<AppSettings>` (loaded at startup).
 - **`llm::get_feedback` change:** instead of reading env vars itself, it receives the resolved connection config (base_url, model, api_key, timeout) from the caller. `stop_recording` reads `AppState.settings` and passes them in. (This removes the env reads from `llm.rs`; env is now only consulted to seed `AppSettings::default()`.)
 
@@ -98,7 +104,7 @@ pub struct AppSettings {
 | Command | Action |
 |---------|--------|
 | `get_settings() -> AppSettings` | returns current in-memory settings (for panel load) |
-| `apply_settings(settings: AppSettings) -> Result<(), String>` | validates, updates `AppState.settings`, saves `settings.json` |
+| `apply_settings(settings: AppSettings) -> Result<(), String>` | **(review #4 — strict ordering)** validate (incl. URL normalize) → **write `settings.json` successfully → only then update `AppState.settings`**. If validation or the file write fails, return `Err` and leave in-memory settings unchanged (so the next analysis never uses settings the UI reported as failed). |
 
 (No `SettingsChanged` event needed — unlike azVoiceAssist there's no long-lived worker thread to notify; the next `stop_recording` simply reads the updated `AppState.settings`.)
 
@@ -108,13 +114,15 @@ pub struct AppSettings {
 |----------|----------|
 | localStorage frost values missing/NaN | use Frosted defaults |
 | `settings.json` missing / unparseable | `AppSettings::default()` (env → built-in) |
-| `apply_settings` invalid (empty URL, timeout out of range) | `Err` → toast in panel, settings unchanged |
+| `apply_settings` invalid (unparseable/no-scheme URL, timeout out of range) | `Err` → toast in panel; neither `settings.json` nor in-memory settings change (review #4 ordering) |
+| Non-loopback oMLX host entered | inline warning + explicit confirm in the panel; allowed on confirm (review #1) |
 | `backdrop-filter` unsupported | `@supports` fallback to near-opaque bg |
 | LLM still unreachable after Apply | existing degradation: diff + pacing shown, score/comments suppressed |
 
 ## Testing
 
-- **Frontend:** frost util (clamp opacity/blur to range; apply sets CSS vars); localStorage load/save round-trip with default fallback; Settings panel renders; preset click sets values; slider updates the variable live; Connection fields populate from `get_settings` and Apply calls `apply_settings`. Lightbox-style portal + Esc/backdrop dismiss for the panel.
+- **Frontend:** frost util (clamp opacity/blur to range; apply sets CSS vars); localStorage load/save round-trip with default fallback; Settings panel renders; preset click sets values; slider updates the variable live; Connection fields populate from `get_settings` and Apply calls `apply_settings`; non-loopback host shows the warning + requires confirm. Lightbox-style portal + Esc/backdrop dismiss for the panel.
+- **(review #7) Mock support:** the current `src/__mocks__/@tauri-apps/api/index.ts` `invoke` resolves `undefined`, which breaks a panel that reads `get_settings` fields. The SettingsPanel test must mock `invoke` so `get_settings` returns representative defaults and `apply_settings` resolves `Ok`. For `VITE_USE_MOCK` UI-dev, `useMockEvents` (or a mock invoke shim) likewise returns default settings so the panel opens without a backend.
 - **Rust:** `AppSettings` default-from-env, `load`/`save` round-trip, validation (reject empty URL / out-of-range timeout) — unit-tested like azVoiceAssist's `settings.rs`.
 - **Live:** open Settings; Frosted/Glass/Solid visibly change the window; slider live-previews; relaunch preserves frost; set a bogus then correct Base URL and confirm the next analysis uses it.
 
@@ -134,3 +142,4 @@ Native vibrancy material; accent/theme colors; per-panel frost; additional setti
 - `src-tauri/src/commands.rs` — `AppState.settings`; `get_settings`, `apply_settings`; `stop_recording` reads settings and passes connection config to `get_feedback`.
 - `src-tauri/src/llm.rs` — `get_feedback` takes resolved connection config instead of reading env directly.
 - `src-tauri/src/lib.rs` — init `AppState.settings` (load at startup); register `get_settings`, `apply_settings`.
+- `src/__mocks__/@tauri-apps/api/index.ts` and/or test setup — **(review #7)** make `invoke("get_settings")` resolve representative defaults and `invoke("apply_settings")` resolve `Ok`, so SettingsPanel tests and `VITE_USE_MOCK` UI-dev work without a backend.
