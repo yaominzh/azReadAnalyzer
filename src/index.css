@@ -14,7 +14,9 @@
 }
 
 body {
-  background: #080808;
+  /* Transparent so the macOS desktop shows through the frosted-glass card
+     (window is transparent + macOSPrivateApi). */
+  background: transparent;
   color: #e8e8e8;
   font-family: var(--font-family-sans);
   margin: 0;
@@ -31,9 +33,5 @@ textarea, input {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 
-.titlebar {
-  -webkit-app-region: drag;
-}
-button, select, input, textarea, a {
-  -webkit-app-region: no-drag;
-}
+/* Window dragging now uses data-tauri-drag-region on the titlebar (the
+   -webkit-app-region approach is unreliable in Tauri). */

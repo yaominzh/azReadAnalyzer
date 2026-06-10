@@ -21,10 +21,13 @@
         "resizable": true,
         "fullscreen": false,
         "decorations": false,
+        "transparent": true,
+        "shadow": false,
         "alwaysOnTop": true
       }
     ],
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "security": { "csp": null }
   },
   "bundle": {

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import TextInputPanel from "./components/TextInputPanel";
 import CaptureControls from "./components/CaptureControls";
@@ -23,19 +24,55 @@ export default function App() {
     invoke("set_always_on_top", { enabled: next }).catch(() => {});
   }
 
+  // Window controls. getCurrentWindow() dereferences __TAURI_INTERNALS__ at
+  // call time and throws outside the Tauri webview (browser/jsdom), so call it
+  // lazily inside each handler, guarded. (TPM M1)
+  const winClose = () => { try { getCurrentWindow().close(); } catch { /* not in Tauri */ } };
+  const winMinimize = () => { try { getCurrentWindow().minimize(); } catch { /* not in Tauri */ } };
+  const winZoom = () => { try { getCurrentWindow().toggleMaximize(); } catch { /* not in Tauri */ } };
+  // Interactive children of the drag region must not let the parent swallow
+  // their mousedown. (TPM M3)
+  const stop = (e: React.MouseEvent) => e.stopPropagation();
+
   return (
-    <div className="flex flex-col h-screen bg-[#080808]">
-      {/* Custom titlebar */}
-      <div className="titlebar flex items-center justify-between px-4 h-10 bg-black/60 border-b border-white/[0.07] flex-shrink-0">
-        <div className="flex gap-1.5">
-          <div className="w-3 h-3 rounded-full bg-[#ff5f57]" />
-          <div className="w-3 h-3 rounded-full bg-[#febc2e]" />
-          <div className="w-3 h-3 rounded-full bg-[#28c840]" />
+    <div className="flex flex-col h-screen rounded-xl overflow-hidden border border-white/10 bg-[#080808]/65 backdrop-blur-2xl">
+      {/* Custom titlebar — whole bar drags the window (data-tauri-drag-region) */}
+      <div
+        data-tauri-drag-region
+        className="titlebar flex items-center justify-between px-4 h-10 bg-black/40 border-b border-white/[0.07] flex-shrink-0"
+      >
+        {/* macOS traffic lights — functional */}
+        <div className="group flex gap-1.5">
+          <button
+            aria-label="Close"
+            onMouseDown={stop}
+            onClick={winClose}
+            className="w-3 h-3 rounded-full bg-[#ff5f57] flex items-center justify-center text-black/60 text-[8px] leading-none"
+          >
+            <span className="opacity-0 group-hover:opacity-100">×</span>
+          </button>
+          <button
+            aria-label="Minimize"
+            onMouseDown={stop}
+            onClick={winMinimize}
+            className="w-3 h-3 rounded-full bg-[#febc2e] flex items-center justify-center text-black/60 text-[8px] leading-none"
+          >
+            <span className="opacity-0 group-hover:opacity-100">−</span>
+          </button>
+          <button
+            aria-label="Zoom"
+            onMouseDown={stop}
+            onClick={winZoom}
+            className="w-3 h-3 rounded-full bg-[#28c840] flex items-center justify-center text-black/60 text-[8px] leading-none"
+          >
+            <span className="opacity-0 group-hover:opacity-100">+</span>
+          </button>
         </div>
         <span className="text-[13px] font-medium text-white/40 tracking-wider">
           azReadAnalyzer
         </span>
         <button
+          onMouseDown={stop}
           onClick={toggleAlwaysOnTop}
           className="flex items-center gap-2 text-[11px] text-white/30 hover:text-white/60 transition-colors"
         >
