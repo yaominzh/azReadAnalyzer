@@ -8,7 +8,7 @@
 
 **Tech Stack:** React 19 + TypeScript + Tailwind v4 + Zustand · Tauri 2 (Rust) · `serde`/`serde_json` · Vitest · `cargo test`.
 
-**Spec:** [docs/superpowers/specs/2026-06-09-settings-panel-frost-design.md](../specs/2026-06-09-settings-panel-frost-design.md) (review-incorporated; finding 1 = warn-and-allow).
+**Spec:** [docs/superpowers/specs/2026-06-10-settings-panel-frost-design.md](../specs/2026-06-10-settings-panel-frost-design.md) (review-incorporated; finding 1 = warn-and-allow).
 
 ---
 

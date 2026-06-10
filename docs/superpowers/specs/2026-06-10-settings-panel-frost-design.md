@@ -1,6 +1,6 @@
 # azReadAnalyzer — Settings Panel + Frost/Transparency Controls
 
-**Date:** 2026-06-09
+**Date:** 2026-06-10
 **Status:** Approved
 **Branch:** `260609-bugfix` (follows the UI-feedback round-1 work)
 **Builds on:** [2026-06-09-ui-feedback-round1-design.md](2026-06-09-ui-feedback-round1-design.md) (frost was introduced there, #2)

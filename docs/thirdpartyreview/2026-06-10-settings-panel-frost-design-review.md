@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-10  
 **Reviewer:** Codex  
-**Spec reviewed:** `docs/superpowers/specs/2026-06-09-settings-panel-frost-design.md`  
+**Spec reviewed:** `docs/superpowers/specs/2026-06-10-settings-panel-frost-design.md`  
 **Reviewed against:** current source, `2026-06-07-azreadanalyzer-design.md`, `2026-06-09-ui-feedback-round1-design.md`, and the azVoiceAssist transparency/settings reference  
 
 ---
