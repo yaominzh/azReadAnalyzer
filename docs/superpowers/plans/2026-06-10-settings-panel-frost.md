@@ -235,9 +235,13 @@ git commit -m "feat(frost): apply persisted frost on app load"
 - Create: `src-tauri/src/settings.rs`
 - Modify: `src-tauri/src/lib.rs` (add `pub mod settings;`)
 
-- [ ] **Step 1: Declare the module** in `src-tauri/src/lib.rs`
+- [ ] **Step 1: Add the `url` crate + declare the module**
 
-Add near the other `pub mod` lines (e.g. after `pub mod llm;`):
+In `src-tauri/Cargo.toml` `[dependencies]` add (already present transitively via reqwest, so this is free):
+```toml
+url = "2"
+```
+In `src-tauri/src/lib.rs`, near the other `pub mod` lines (e.g. after `pub mod llm;`):
 ```rust
 pub mod settings;
 ```
@@ -297,31 +301,48 @@ impl AppSettings {
     }
 
     pub fn load() -> Self {
-        let path = Self::config_path();
-        std::fs::read_to_string(&path)
+        Self::load_from(&Self::config_path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str::<AppSettings>(&s).ok())
             .unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path();
+        self.save_to(&Self::config_path())
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| e.to_string())
+        std::fs::write(path, json).map_err(|e| e.to_string())
     }
 
-    /// Validate + normalize in place. Trims the URL, strips trailing slashes,
-    /// requires an http/https scheme, and enforces the timeout range. Returns
-    /// Err (no mutation persisted by the caller) on invalid input.
+    /// Validate + normalize in place (review #3): parse with the `url` crate,
+    /// require an http/https scheme + host, strip a trailing `/chat/completions`
+    /// (llm.rs appends that itself) and any trailing slash, and enforce the
+    /// timeout range. Returns Err (caller persists nothing) on invalid input.
     pub fn validate_and_normalize(&mut self) -> Result<(), String> {
-        let url = self.llm_base_url.trim().trim_end_matches('/').to_string();
-        if !(url.starts_with("http://") || url.starts_with("https://")) || url.len() < 10 {
-            return Err("Base URL must start with http:// or https://".into());
+        let raw = self.llm_base_url.trim();
+        let parsed = url::Url::parse(raw).map_err(|_| "Base URL is not a valid URL".to_string())?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            _ => return Err("Base URL must use http or https".into()),
         }
-        self.llm_base_url = url;
+        if parsed.host_str().is_none() {
+            return Err("Base URL must include a host".into());
+        }
+        let mut base = raw.trim_end_matches('/').to_string();
+        if let Some(stripped) = base.strip_suffix("/chat/completions") {
+            base = stripped.trim_end_matches('/').to_string();
+        }
+        self.llm_base_url = base;
+
         self.llm_model = self.llm_model.trim().to_string();
         if self.llm_model.is_empty() {
             return Err("Model must not be empty".into());
@@ -368,16 +389,21 @@ mod tests {
     }
 
     #[test]
-    fn save_then_load_roundtrips() {
+    fn normalize_strips_chat_completions_suffix() {
+        let mut s = AppSettings::builtin();
+        s.llm_base_url = "http://127.0.0.1:8002/v1/chat/completions".into();
+        s.validate_and_normalize().unwrap();
+        assert_eq!(s.llm_base_url, "http://127.0.0.1:8002/v1");
+    }
+
+    #[test]
+    fn save_to_then_load_from_roundtrips() {
+        // (review #6) exercises the real save_to/load_from, not manual JSON.
         let mut s = AppSettings::builtin();
         s.llm_model = "gemma-4-e4b-it-4bit".into();
-        // Write to a temp path by overriding HOME for this test.
-        let dir = std::env::temp_dir().join("azra_settings_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("settings.json");
-        let json = serde_json::to_string_pretty(&s).unwrap();
-        std::fs::write(&path, &json).unwrap();
-        let back: AppSettings = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let path = std::env::temp_dir().join("azra_settings_test").join("settings.json");
+        s.save_to(&path).unwrap();
+        let back = AppSettings::load_from(&path);
         assert_eq!(s, back);
     }
 }
@@ -507,7 +533,13 @@ Replace the test body that sets env with a config:
 ```rust
     #[tokio::test]
     async fn returns_err_when_llm_unreachable() {
-        let cfg = LlmConfig { base_url: "http://127.0.0.1:19999/v1", model: "default", api_key: "", timeout_secs: 5 };
+        // (review #2) LlmConfig fields are owned String — use .into()/String::new(), not &str.
+        let cfg = LlmConfig {
+            base_url: "http://127.0.0.1:19999/v1".into(),
+            model: "default".into(),
+            api_key: String::new(),
+            timeout_secs: 5,
+        };
         let result = get_feedback("hello", "hello", &[], &crate::events::PacingMetrics::default(), &cfg).await;
         assert!(result.is_err());
     }
@@ -625,12 +657,16 @@ git commit -m "feat(settings): AppSettings TS type + get/apply_settings mock"
 ```tsx
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import SettingsPanel from "../SettingsPanel";
 import { loadFrost } from "../../lib/frost";
 import { invoke } from "@tauri-apps/api/core";
 
 describe("SettingsPanel", () => {
+  // (review #5) `vi` is used here (clears mock call history between tests so the
+  // confirm-gate assertion below is reliable); clearAllMocks keeps impls.
+  beforeEach(() => { vi.clearAllMocks(); localStorage.clear(); });
+
   it("renders Appearance presets and Connection fields", async () => {
     render(<SettingsPanel onClose={() => {}} />);
     expect(screen.getByRole("button", { name: /frosted/i })).toBeInTheDocument();
@@ -652,9 +688,25 @@ describe("SettingsPanel", () => {
     expect(screen.getByText(/sends your reading text off this machine/i)).toBeInTheDocument();
   });
 
-  it("Apply calls apply_settings", async () => {
+  it("Apply calls apply_settings (loopback default, no confirm needed)", async () => {
     render(<SettingsPanel onClose={() => {}} />);
     await screen.findByLabelText(/oMLX Base URL/i);
+    await userEvent.click(screen.getByRole("button", { name: /^apply$/i }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("apply_settings", expect.objectContaining({ settings: expect.any(Object) }))
+    );
+  });
+
+  it("does NOT apply a non-loopback URL until confirmed (review #1)", async () => {
+    render(<SettingsPanel onClose={() => {}} />);
+    const url = await screen.findByLabelText(/oMLX Base URL/i);
+    await userEvent.clear(url);
+    await userEvent.type(url, "http://192.168.1.50:8002/v1");
+    // Apply is disabled until confirm → clicking does nothing.
+    await userEvent.click(screen.getByRole("button", { name: /^apply$/i }));
+    expect(invoke).not.toHaveBeenCalledWith("apply_settings", expect.anything());
+    // Confirm, then Apply goes through.
+    await userEvent.click(screen.getByRole("checkbox"));
     await userEvent.click(screen.getByRole("button", { name: /^apply$/i }));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("apply_settings", expect.objectContaining({ settings: expect.any(Object) }))
@@ -687,13 +739,23 @@ function isLoopback(rawUrl: string): boolean {
   }
 }
 
+const BUILTIN_SETTINGS: AppSettings = {
+  llmBaseUrl: "http://127.0.0.1:8002/v1",
+  llmModel: "default",
+  llmApiKey: "",
+  llmTimeoutSecs: 45,
+};
+
 export default function SettingsPanel({ onClose }: { onClose: () => void }) {
   const addToast = useAppStore((s) => s.addToast);
   const [frost, setFrost] = useState<Frost>(() => loadFrost());
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [confirmedOffDevice, setConfirmedOffDevice] = useState(false);
 
-  // Load Rust-backed connection settings on open.
+  // Load Rust-backed connection settings on open. Browser mock mode has no
+  // Tauri backend (review #4) → use built-in defaults instead of invoke.
   useEffect(() => {
+    if (import.meta.env.VITE_USE_MOCK) { setSettings(BUILTIN_SETTINGS); return; }
     invoke<AppSettings>("get_settings").then(setSettings).catch(() => {});
   }, []);
 
@@ -708,8 +770,16 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
   function setAlpha(alpha: number) { const f = { ...frost, alpha }; setFrost(f); saveFrost(f); }
   function setBlur(blur: number) { const f = { ...frost, blur }; setFrost(f); saveFrost(f); }
 
+  const nonLocal = settings ? !isLoopback(settings.llmBaseUrl) : false;
+
   async function applyConnection() {
     if (!settings) return;
+    // (review #1) non-loopback requires explicit confirmation before Apply.
+    if (nonLocal && !confirmedOffDevice) {
+      addToast("Confirm the off-device warning before applying", "error");
+      return;
+    }
+    if (import.meta.env.VITE_USE_MOCK) { addToast("Settings saved (mock)", "info"); onClose(); return; }
     try {
       await invoke("apply_settings", { settings });
       addToast("Settings saved", "info");
@@ -718,8 +788,6 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
       addToast(String(e), "error");
     }
   }
-
-  const nonLocal = settings ? !isLoopback(settings.llmBaseUrl) : false;
 
   return createPortal(
     <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" style={{ backdropFilter: "blur(24px)", WebkitBackdropFilter: "blur(24px)" }}>
@@ -736,16 +804,20 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             </button>
           ))}
         </div>
-        <label className="block text-[11px] text-white/45 mb-3">
-          Opacity {Math.round(frost.alpha * 100)}%
-          <input type="range" min={5} max={95} value={Math.round(frost.alpha * 100)}
-            onChange={(e) => setAlpha(Number(e.target.value) / 100)} className="w-full" />
-        </label>
-        <label className="block text-[11px] text-white/45 mb-4">
-          Blur {frost.blur}px
-          <input type="range" min={0} max={40} value={frost.blur}
-            onChange={(e) => setBlur(Number(e.target.value))} className="w-full" />
-        </label>
+        {/* (review #7) sliders live under an expandable Advanced disclosure */}
+        <details className="mb-3">
+          <summary className="text-[11px] text-white/45 cursor-pointer select-none">Advanced</summary>
+          <label className="block text-[11px] text-white/45 mt-2 mb-3">
+            Opacity {Math.round(frost.alpha * 100)}%
+            <input type="range" min={5} max={95} value={Math.round(frost.alpha * 100)}
+              onChange={(e) => setAlpha(Number(e.target.value) / 100)} className="w-full" />
+          </label>
+          <label className="block text-[11px] text-white/45 mb-2">
+            Blur {frost.blur}px
+            <input type="range" min={0} max={40} value={frost.blur}
+              onChange={(e) => setBlur(Number(e.target.value))} className="w-full" />
+          </label>
+        </details>
         <button onClick={() => setPreset(FROST_DEFAULT)} className="text-[11px] text-white/35 hover:text-white/60 mb-4">Reset appearance</button>
 
         {/* Connection */}
@@ -754,11 +826,18 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
           <div className="flex flex-col gap-2.5">
             <label className="text-[11px] text-white/45">oMLX Base URL
               <input aria-label="oMLX Base URL" type="text" value={settings.llmBaseUrl}
-                onChange={(e) => setSettings({ ...settings, llmBaseUrl: e.target.value })}
+                onChange={(e) => { setSettings({ ...settings, llmBaseUrl: e.target.value }); setConfirmedOffDevice(false); }}
                 className="w-full mt-1 bg-white/[0.06] border border-white/10 rounded px-2 py-1 text-[12px] text-white/80" />
             </label>
             {nonLocal && (
-              <p className="text-[11px] text-amber-300/90">⚠ This sends your reading text off this machine (not 127.0.0.1).</p>
+              <div className="text-[11px] text-amber-300/90">
+                <p>⚠ This sends your reading text off this machine (not 127.0.0.1).</p>
+                <label className="flex items-center gap-1.5 mt-1 text-amber-200/90">
+                  <input type="checkbox" checked={confirmedOffDevice}
+                    onChange={(e) => setConfirmedOffDevice(e.target.checked)} />
+                  I understand and want to use this remote endpoint
+                </label>
+              </div>
             )}
             <label className="text-[11px] text-white/45">Model
               <input aria-label="Model" type="text" value={settings.llmModel}
@@ -779,8 +858,9 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
         )}
 
         <div className="flex gap-2 mt-5">
-          <button onClick={applyConnection} className="flex-1 py-2 rounded-lg text-[12px] font-medium bg-gradient-to-br from-indigo-500 to-indigo-400 text-white">Apply</button>
-          <button onClick={() => setSettings({ llmBaseUrl: "http://127.0.0.1:8002/v1", llmModel: "default", llmApiKey: "", llmTimeoutSecs: 45 })}
+          <button onClick={applyConnection} disabled={nonLocal && !confirmedOffDevice}
+            className="flex-1 py-2 rounded-lg text-[12px] font-medium bg-gradient-to-br from-indigo-500 to-indigo-400 text-white disabled:opacity-40 disabled:cursor-not-allowed">Apply</button>
+          <button onClick={() => { setSettings(BUILTIN_SETTINGS); setConfirmedOffDevice(false); }}
             className="px-3 py-2 rounded-lg text-[12px] bg-white/[0.06] border border-white/10 text-white/60">Defaults</button>
           <button onClick={onClose} className="px-3 py-2 rounded-lg text-[12px] bg-white/[0.06] border border-white/10 text-white/60">Cancel</button>
         </div>
@@ -870,3 +950,4 @@ git commit -m "feat(settings): gear button opens the Settings panel"
 - **Spec coverage:** Part A frost → Tasks 1–3. Part B Appearance (presets+sliders, localStorage, instant) → Tasks 2,3,8. Connection (Rust settings.json, get/apply, default-from-env, normalize, strict ordering, Defaults=built-in, warn-and-allow) → Tasks 4–6,8. Mock (#7) → Task 7. No `SettingsChanged` (#5) — not added. ✓
 - **Types consistent:** Rust `AppSettings` camelCase ↔ TS `AppSettings` (`llmBaseUrl`…); `LlmConfig` owns `String`s; `apply_settings(settings)` arg name matches the TS `invoke("apply_settings", { settings })`. ✓
 - **Frost values consistent** across `index.css` (0.55/16), `frost.ts` `FROST_DEFAULT`/`FROST_PRESETS`, and the panel. ✓
+- **Plan-review (Codex 2026-06-10) findings applied:** #1 non-loopback confirm gate (checkbox + disabled Apply + test); #2 `LlmConfig` test uses owned `String` `.into()`; #3 `url`-crate parse + strip `/chat/completions` (+`url` dep, free/transitive); #4 `VITE_USE_MOCK` branch so the panel works in browser mock; #5 `vi` now used intentionally (`beforeEach(vi.clearAllMocks)`); #6 `save_to`/`load_from` helpers exercised by the roundtrip test; #7 Advanced sliders under a `<details>` disclosure. ✓
