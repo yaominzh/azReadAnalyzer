@@ -5,6 +5,7 @@
 **Branch:** `260609-bugfix`
 **Type:** Bug fix (#1) + UX enhancements (#2–#4) from live testing of the MVP.
 **Builds on:** [2026-06-07-azreadanalyzer-design.md](2026-06-07-azreadanalyzer-design.md), [2026-06-08-azreadanalyzer-tierb-hardening.md](2026-06-08-azreadanalyzer-tierb-hardening.md)
+**Review incorporated:** [2026-06-09-ui-feedback-round1-design-review.md](../thirdpartyreview/2026-06-09-ui-feedback-round1-design-review.md) (Codex) — findings 1–5 + the RGBA channel-order note, all verified and applied.
 
 ---
 
@@ -21,6 +22,19 @@ All four ship together on `260609-bugfix`. Item #1 is the only true bug and the 
 
 ---
 
+## Goals
+
+The goal of this round is to turn the four pieces of first-use friction into a polished, native-feeling macOS capture → listen → record → review loop. The MVP works; this round makes it feel finished. Concretely, by the end of this round:
+
+1. **The window behaves like a real app window.** Using the custom macOS-style titlebar (no native chrome), you can close, drag, and resize it. *Success:* all three traffic-light buttons work (close/minimize/zoom), the titlebar drags the window, and edges resize it — verified live. (Fixes the only true bug.)
+2. **The UI matches the azVoiceAssist aesthetic.** A frosted, translucent glass window through which the desktop shows. *Success:* `transparent` window + `macOSPrivateApi` + CSS `backdrop-blur` produce visible frost, verified live.
+3. **You can hear your own reading back.** Replay the recording you just made, to self-assess and compare against the reference TTS. *Success:* a "Your reading" control plays your last recording after analysis.
+4. **Captured images are visible and inspectable.** Any image you bring in — a screenshot capture or a pasted clipboard image — shows as a thumbnail you can click to enlarge (ChatGPT-style), while still driving OCR → reading text. *Success:* a thumbnail appears for image captures, clicking it opens a full-size lightbox, and plain text paste is unaffected.
+
+**Non-goals this round:** no changes to the analysis pipeline (STT / diff / pacing / LLM); no image history or multiple thumbnails; no cross-restart persistence; no Windows/Linux chrome. (See also Out of Scope.)
+
+---
+
 ## Shared architecture decisions
 
 - **Binary → frontend transfer** reuses the existing Tier-B B1 pattern: Rust commands return `tauri::ipc::Response` (raw bytes); the frontend wraps the resulting `ArrayBuffer` in a `Blob` + object URL. Used for replay audio (#3) and thumbnail image (#4) — no base64 bloat.
@@ -29,7 +43,9 @@ All four ship together on `260609-bugfix`. Item #1 is the only true bug and the 
   - `last_capture_png: Mutex<Option<Vec<u8>>>`
 
   Both are in-memory only, replaced on each new recording/capture, and dropped when the app quits. No new files persist beyond the existing auto-deleted temp files. Stays 100% on-device.
-- **New Rust dependency**: `image` crate (PNG encoding) — needed to turn clipboard RGBA into a PNG for OCR + thumbnail. The screenshot path is already PNG and needs no encoding.
+- **Single source of truth for media state (review finding #1).** The Rust-side `last_capture_png` is authoritative for whether a thumbnail exists; the frontend must never get out of sync with it. A new command `clear_session_media()` drops `last_capture_png` (and is the only correct way to clear a thumbnail). `last_capture_png` is cleared whenever: Clear / New Text is pressed, `paste_clipboard` returns text-only, or a capture/OCR attempt fails. (`last_recording_wav` is simply overwritten each recording; no explicit clear needed since the replay control is gated on the feedback existing.)
+- **Object-URL lifecycle (review finding #5).** Replay audio (#3) and thumbnail/lightbox images (#4) use `Blob` object URLs. Every generated object URL **must be `URL.revokeObjectURL`'d** when it is replaced, when the media is cleared, when playback ends or fails, and when the owning component unmounts. (`PlaybackControls` already does this on `onended`; the new replay and thumbnail code follows the same rule.)
+- **New Rust dependency**: `image` crate (PNG encoding) — needed to turn clipboard RGBA into a PNG for OCR + thumbnail. The screenshot path is already PNG and needs no encoding. **Preserve arboard's RGBA channel order** when constructing the PNG (arboard `ImageData.bytes` is RGBA8; encode as `Rgba8`).
 
 ---
 
@@ -44,7 +60,7 @@ Keep `decorations: false` and the custom macOS-style frosted titlebar (the look 
   - amber → `minimize()`
   - green → `toggleMaximize()`
   - Add macOS-style hover glyphs (×, −, +) for affordance.
-- Capabilities (`src-tauri/capabilities/default.json`): add `core:window:allow-close`, `core:window:allow-minimize`, `core:window:allow-maximize`, `core:window:allow-unmaximize`, `core:window:allow-start-dragging`.
+- Capabilities (`src-tauri/capabilities/default.json`): add `core:window:allow-close`, `core:window:allow-minimize`, `core:window:allow-toggle-maximize`, `core:window:allow-start-dragging`. (Use `allow-toggle-maximize` to match the `toggleMaximize()` API — verified present in `gen/schemas/acl-manifests.json`. `allow-maximize`/`allow-unmaximize` are only needed if those APIs are called directly, which they are not.)
 - Edge-resize: `resizable: true` + decorationless should already allow dragging window edges; **verify live**. If macOS does not expose resize edges on a transparent decorationless window, add a thin CSS resize affordance — decide only if the live check fails.
 
 **Verification:** live — click each dot (close/min/zoom), drag the titlebar, drag an edge to resize.
@@ -82,12 +98,13 @@ Today the recording WAV (`NamedTempFile`) is deleted immediately after transcrip
 **Unified capture model:** any image source — a screenshot capture **or** a pasted clipboard image — produces (a) reading text via OCR and (b) a PNG stored in `last_capture_png`, surfaced as a clickable thumbnail. Plain clipboard **text** paste stays text-only (no thumbnail).
 
 **Changes**
-- `paste_clipboard` is upgraded: check clipboard **text** first → if present, return it (no image). If no text, try `get_image()` (arboard RGBA) → encode to PNG via the `image` crate → write to a unique temp PNG → OCR it → store the PNG in `last_capture_png`. Return shape changes from `String` to `{ text: String, hasImage: bool }`.
+- `paste_clipboard` is upgraded. **Clipboard precedence (review finding #4): text-first.** If the clipboard has non-empty text, return it as text-only **and clear `last_capture_png`** (no thumbnail). Only if there is no text, try `get_image()` (arboard RGBA) → encode to PNG via the `image` crate → write to a unique temp PNG → OCR it → store the PNG in `last_capture_png`. Return shape changes from `String` to `{ text: String, hasImage: bool }`.
+  - *Documented tradeoff:* a clipboard carrying **both** image and text flavors is treated as text-only. This is deliberate — this app's primary Paste content is reading text, and the user's image-paste case (a screenshot on the clipboard) is image-only, so it correctly takes the image branch. Pure-image clipboards → thumbnail; mixed → text.
 - `capture_screenshot`: in addition to OCR, read the screenshot PNG bytes into `last_capture_png` before the temp file drops.
 - `text-captured` event payload gains `hasImage: bool`.
 - New command `get_capture_image() -> Result<tauri::ipc::Response, String>` returning the stored PNG bytes.
-- Frontend: when `hasImage` is true, fetch the PNG via `get_capture_image()`, build an object URL, and render a **thumbnail chip on the Text Input panel**. Click → **full-size lightbox overlay** (dismiss on click or Esc) — the ChatGPT pattern.
-- **Clear / New Text** clears the thumbnail and drops `last_capture_png` in Rust.
+- Frontend: when `hasImage` is true, fetch the PNG via `get_capture_image()`, build an object URL, and render a **thumbnail chip on the Text Input panel**. Click → **full-size lightbox overlay** (dismiss on click or Esc) — the ChatGPT pattern. Revoke the object URL on replacement/clear/unmount (per the lifecycle rule above).
+- **Clear / New Text** calls the new `clear_session_media()` command (drops `last_capture_png` in Rust) **and** clears the frontend thumbnail, keeping both sides in sync (review finding #1). On a failed capture/OCR, `last_capture_png` is likewise cleared so a stale image can never be returned by `get_capture_image()`.
 
 **Verification:** Rust unit — clipboard RGBA → PNG encode roundtrip; `AppState` stores/replaces the capture PNG. Frontend — thumbnail renders only when `hasImage`; lightbox opens/closes. Live — screenshot and paste-image both show a thumbnail; click enlarges.
 
@@ -98,7 +115,7 @@ Today the recording WAV (`NamedTempFile`) is deleted immediately after transcrip
 | Scenario | Handling |
 |----------|----------|
 | Clipboard has neither text nor image | Existing toast: "No text in clipboard" |
-| Clipboard image decode/encode/OCR fails | Toast; no thumbnail; input text unchanged |
+| Clipboard image decode/encode/OCR fails | Toast; `last_capture_png` cleared; no thumbnail; input text unchanged |
 | `get_last_recording` / `get_capture_image` with nothing stored | Control hidden/disabled; no error surfaced |
 | Window-control permission missing | Caught at build (capabilities); verified live |
 
@@ -118,7 +135,8 @@ Today the recording WAV (`NamedTempFile`) is deleted immediately after transcrip
 - `src-tauri/tauri.conf.json` — transparent + macOSPrivateApi (#2).
 - `src-tauri/Cargo.toml` — `macos-private-api` feature, `image` crate (#2, #4).
 - `src-tauri/capabilities/default.json` — window control permissions (#1).
-- `src-tauri/src/commands.rs` — `AppState` fields; `paste_clipboard` reshape; `get_last_recording`, `get_capture_image`; `stop_recording` keeps WAV; `capture_screenshot` keeps PNG (#1 none) (#3, #4).
+- `src-tauri/src/lib.rs` — **(review finding #2)** initialize the two new `AppState` fields (`last_recording_wav`, `last_capture_png`) in the `.manage(Arc::new(AppState { … }))` block, and add `get_last_recording`, `get_capture_image`, and `clear_session_media` to `tauri::generate_handler!`. Without this, the fields won't initialize and the commands won't be exposed.
+- `src-tauri/src/commands.rs` — add `AppState` fields; reshape `paste_clipboard` → `{ text, hasImage }`; new commands `get_last_recording`, `get_capture_image`, `clear_session_media`; `stop_recording` copies WAV into `last_recording_wav`; `capture_screenshot` copies PNG into `last_capture_png` (#1, #3, #4).
 - `src-tauri/src/clipboard.rs` — image read + PNG encode (#4).
 - `src-tauri/src/events.rs` — `text-captured` gains `hasImage` (#4).
 - `src/App.tsx` — functional titlebar + drag region (#1); rounded translucent root (#2).
