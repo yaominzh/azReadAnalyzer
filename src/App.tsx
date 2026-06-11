@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { loadFrost, applyFrost } from "./lib/frost";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Group, Panel, Separator } from "react-resizable-panels";
@@ -18,6 +19,10 @@ export default function App() {
 
   useTauriEvents();
   useMockEvents();
+
+  useEffect(() => {
+    applyFrost(loadFrost());
+  }, []);
 
   function toggleAlwaysOnTop() {
     const next = !alwaysOnTop;
