@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { loadFrost, applyFrost } from "./lib/frost";
 import { invoke } from "@tauri-apps/api/core";
+import SettingsPanel from "./components/SettingsPanel";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import TextInputPanel from "./components/TextInputPanel";
@@ -16,6 +17,7 @@ import { useMockEvents } from "./hooks/useMockEvents";
 export default function App() {
   // Window starts always-on-top (tauri.conf.json alwaysOnTop: true); toggle flips it.
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useTauriEvents();
   useMockEvents();
@@ -77,16 +79,26 @@ export default function App() {
         <span className="text-[13px] font-medium text-white/40 tracking-wider">
           azReadAnalyzer
         </span>
-        <button
-          onMouseDown={stop}
-          onClick={toggleAlwaysOnTop}
-          className="flex items-center gap-2 text-[11px] text-white/30 hover:text-white/60 transition-colors"
-        >
-          <span>Always on top</span>
-          <div className={`w-7 h-4 rounded-full relative transition-colors ${alwaysOnTop ? "bg-[#6366f1]/50" : "bg-white/10"}`}>
-            <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${alwaysOnTop ? "left-3.5" : "left-0.5"}`} />
-          </div>
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onMouseDown={stop}
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Settings"
+            className="text-white/30 hover:text-white/60 transition-colors text-[14px]"
+          >
+            ⚙
+          </button>
+          <button
+            onMouseDown={stop}
+            onClick={toggleAlwaysOnTop}
+            className="flex items-center gap-2 text-[11px] text-white/30 hover:text-white/60 transition-colors"
+          >
+            <span>Always on top</span>
+            <div className={`w-7 h-4 rounded-full relative transition-colors ${alwaysOnTop ? "bg-[#6366f1]/50" : "bg-white/10"}`}>
+              <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${alwaysOnTop ? "left-3.5" : "left-0.5"}`} />
+            </div>
+          </button>
+        </div>
       </div>
 
       {/* Two-panel body */}
@@ -121,6 +133,7 @@ export default function App() {
       </div>
 
       <Toasts />
+      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }
