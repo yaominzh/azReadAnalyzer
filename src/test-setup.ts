@@ -24,3 +24,8 @@ if (typeof localStorage === "undefined" || typeof localStorage.clear !== "functi
     writable: true,
   });
 }
+
+vi.mock("@tauri-apps/api/core", async () => {
+  const m = await import("./__mocks__/@tauri-apps/api/index");
+  return { invoke: m.invoke };
+});

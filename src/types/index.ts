@@ -73,3 +73,11 @@ export interface Toast {
   message: string;
   type: "error" | "info";
 }
+
+// LLM connection settings (Rust AppSettings, camelCase serde) (#settings)
+export interface AppSettings {
+  llmBaseUrl: string;
+  llmModel: string;
+  llmApiKey: string;
+  llmTimeoutSecs: number;
+}
