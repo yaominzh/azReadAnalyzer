@@ -5,6 +5,7 @@ pub mod stt;
 pub mod diff;
 pub mod fluency;
 pub mod llm;
+pub mod settings;
 mod commands;
 mod events;
 

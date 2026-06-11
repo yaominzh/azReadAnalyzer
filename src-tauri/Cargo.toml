@@ -43,5 +43,9 @@ transcribe-rs = { version = "0.3.11", features = ["whisper-cpp"] }
 # In [dependencies] (not dev-only) because runtime code uses it.
 tempfile = "3"
 
+# URL parsing/validation for AppSettings.validate_and_normalize (free — already
+# a transitive dep via reqwest).
+url = "2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 transcribe-rs = { version = "0.3.11", features = ["whisper-cpp", "whisper-metal"] }
