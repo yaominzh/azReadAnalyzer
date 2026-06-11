@@ -14,6 +14,9 @@ pub struct AppState {
     // image), for the thumbnail/lightbox (#4). Authoritative for "is there a
     // thumbnail"; cleared on text-only paste / clear / capture failure.
     pub last_capture_png: Mutex<Option<Vec<u8>>>,
+    // User settings (LLM/oMLX connection), loaded at startup, edited via the
+    // Settings panel. Persisted to ~/.azreadanalyzer/settings.json.
+    pub settings: Mutex<crate::settings::AppSettings>,
 }
 
 // SAFETY: Recorder holds cpal::Stream which is not Send, but access is
@@ -223,4 +226,24 @@ pub async fn stop_recording(
     crate::events::emit_recording_state(&app, "idle");
     Ok(())
     // `wav` (a NamedTempFile) drops here → recording file auto-deleted.
+}
+
+#[command]
+pub fn get_settings(state: State<'_, Arc<AppState>>) -> Result<crate::settings::AppSettings, String> {
+    let g = state.settings.lock().map_err(|e| e.to_string())?;
+    Ok(g.clone())
+}
+
+/// Strict ordering (spec review #4): validate+normalize → write file → THEN
+/// update in-memory. On any failure, settings.json and AppState are unchanged.
+#[command]
+pub fn apply_settings(
+    state: State<'_, Arc<AppState>>,
+    mut settings: crate::settings::AppSettings,
+) -> Result<(), String> {
+    settings.validate_and_normalize()?;
+    settings.save()?; // write file first
+    let mut g = state.settings.lock().map_err(|e| e.to_string())?;
+    *g = settings; // only update memory after a successful write
+    Ok(())
 }
