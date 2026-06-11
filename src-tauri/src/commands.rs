@@ -202,10 +202,20 @@ pub async fn stop_recording(
     let diff = crate::diff::word_diff(&original_text, &result.text);
     let pacing = crate::fluency::compute_pacing(&result.words, result.segment_count);
 
+    let cfg = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        crate::llm::LlmConfig {
+            base_url: s.llm_base_url.clone(),
+            model: s.llm_model.clone(),
+            api_key: s.llm_api_key.clone(),
+            timeout_secs: s.llm_timeout_secs,
+        }
+    }; // guard dropped here — not held across the await
+
     // LLM is best-effort. If it's unreachable, score = None and comments = [];
     // the UI still shows the locally-computed diff + pacing.
     let (score, comments) =
-        match crate::llm::get_feedback(&original_text, &result.text, &diff, &pacing).await {
+        match crate::llm::get_feedback(&original_text, &result.text, &diff, &pacing, &cfg).await {
             Ok((s, c)) => (Some(s), c),
             Err(e) => {
                 log::warn!("LLM feedback unavailable: {e}");

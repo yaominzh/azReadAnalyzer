@@ -5,7 +5,14 @@ use serde::Deserialize;
 
 use crate::events::{DiffToken, LlmComment, PacingMetrics};
 
-const DEFAULT_TIMEOUT_SECS: u64 = 45;
+/// Resolved LLM connection config, passed in by the caller (from AppState.settings)
+/// so this module no longer reads env directly.
+pub struct LlmConfig {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    pub timeout_secs: u64,
+}
 
 #[derive(Deserialize, Debug)]
 struct LlmResponse {
@@ -28,19 +35,12 @@ pub async fn get_feedback(
     transcription: &str,
     diff: &[DiffToken],
     pacing: &PacingMetrics,
+    cfg: &LlmConfig,
 ) -> Result<(u32, Vec<LlmComment>), String> {
-    let base_url =
-        std::env::var("OMLX_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8002/v1".into());
-    let api_key = std::env::var("OMLX_API_KEY").unwrap_or_default();
-    let model = std::env::var("OMLX_MODEL").unwrap_or_else(|_| "default".into());
-
-    // Tier-B B2: bound the request so a cold/slow local model can't hang the
-    // Analyze step forever. Configurable via OMLX_TIMEOUT_SECS (default 45).
-    let timeout_secs = std::env::var("OMLX_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let base_url = &cfg.base_url;
+    let api_key = &cfg.api_key;
+    let model = &cfg.model;
+    let timeout_secs = cfg.timeout_secs;
 
     // Summarize the Rust-computed diff for the prompt.
     let missed: Vec<&str> = diff
@@ -153,12 +153,17 @@ fn extract_json_object(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::PacingMetrics;
 
     #[tokio::test]
     async fn returns_err_when_llm_unreachable() {
-        std::env::set_var("OMLX_BASE_URL", "http://127.0.0.1:19999/v1");
-        let result = get_feedback("hello", "hello", &[], &PacingMetrics::default()).await;
+        // (review #2) LlmConfig fields are owned String — use .into()/String::new(), not &str.
+        let cfg = LlmConfig {
+            base_url: "http://127.0.0.1:19999/v1".into(),
+            model: "default".into(),
+            api_key: String::new(),
+            timeout_secs: 5,
+        };
+        let result = get_feedback("hello", "hello", &[], &crate::events::PacingMetrics::default(), &cfg).await;
         assert!(result.is_err());
     }
 
