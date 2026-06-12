@@ -120,8 +120,10 @@ function DiffView({ tokens }: { tokens: DiffToken[] }) {
             t.type === "correct"
               ? "text-white/85"
               : t.type === "missed"
-              ? "line-through text-red-300 bg-red-500/20 rounded px-0.5 mx-0.5"
-              : "text-green-300 bg-green-500/15 rounded px-0.5 mx-0.5"
+              ? // original word (the target you should have said) — green, readable
+                "text-green-300 bg-green-500/15 rounded px-0.5 mx-0.5"
+              : // what you said that's wrong/extra — red, struck out
+                "line-through text-red-300 bg-red-500/20 rounded px-0.5 mx-0.5"
           }
         >
           {t.text}
@@ -174,8 +176,8 @@ export default function FeedbackPanel() {
       </p>
       <DiffView tokens={feedback.diff} />
       <div className="flex gap-4 mb-3">
-        <span className="text-[10px] text-red-300">■ missed</span>
-        <span className="text-[10px] text-green-300">■ said instead</span>
+        <span className="text-[10px] text-green-300">■ original (target)</span>
+        <span className="text-[10px] text-red-300 line-through">said instead</span>
       </div>
 
       {/* LLM comments (empty when LLM unreachable → show a quiet notice instead) */}
