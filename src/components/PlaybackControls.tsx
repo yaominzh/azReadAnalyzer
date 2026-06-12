@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/useAppStore";
 
@@ -12,45 +12,119 @@ export default function PlaybackControls() {
   const setTtsState = useAppStore((s) => s.setTtsState);
   const addToast = useAppStore((s) => s.addToast);
 
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Playback via the Web Audio API (decodeAudioData + AudioBufferSourceNode).
+  // The WebView <audio> element renders this 24kHz TTS WAV with a robotic /
+  // "machinery" timbre, even though the identical bytes play cleanly natively;
+  // Web Audio decodes + resamples with the high-quality path and fixes it.
+  const ctxRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const bufferRef = useRef<AudioBuffer | null>(null);
+  const startedAtRef = useRef(0);    // ctx time when the current segment started
+  const offsetRef = useRef(0);       // buffer offset (s) the current segment started at
+  const rafRef = useRef<number | null>(null);
+  const stoppingRef = useRef(false); // true => the next onended is a manual stop/replace
+  const speedRef = useRef(ttsSpeed); // mirror of ttsSpeed for the rAF/commit math
+  speedRef.current = ttsSpeed;
+
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
 
   const disabled = !inputText.trim();
 
+  function getCtx(): AudioContext {
+    if (!ctxRef.current) ctxRef.current = new AudioContext();
+    return ctxRef.current;
+  }
+
+  function stopProgress() {
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+  }
+
+  function teardownSource() {
+    if (sourceRef.current) {
+      stoppingRef.current = true;
+      try { sourceRef.current.stop(); } catch { /* already stopped */ }
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+  }
+
+  function tick() {
+    const ctx = ctxRef.current;
+    const buf = bufferRef.current;
+    if (!ctx || !buf) return;
+    const cur = offsetRef.current + (ctx.currentTime - startedAtRef.current) * speedRef.current;
+    const clamped = Math.min(cur, buf.duration);
+    setCurrentTime(clamped);
+    setProgress(buf.duration ? clamped / buf.duration : 0);
+    if (cur < buf.duration) rafRef.current = requestAnimationFrame(tick);
+  }
+
+  function playFrom(offset: number) {
+    const ctx = getCtx();
+    const buf = bufferRef.current;
+    if (!buf) return;
+    teardownSource();
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = speedRef.current;
+    src.connect(ctx.destination);
+    src.onended = () => {
+      if (stoppingRef.current) { stoppingRef.current = false; return; } // manual stop/replace
+      stopProgress();
+      offsetRef.current = 0;
+      setProgress(0);
+      setCurrentTime(0);
+      setTtsState("idle");
+    };
+    stoppingRef.current = false;
+    src.start(0, offset);
+    sourceRef.current = src;
+    startedAtRef.current = ctx.currentTime;
+    offsetRef.current = offset;
+    stopProgress();
+    rafRef.current = requestAnimationFrame(tick);
+  }
+
   async function handlePlay() {
     if (ttsState === "playing") {
-      audioRef.current?.pause();
+      // Pause: remember the position, stop the source.
+      const ctx = ctxRef.current;
+      if (ctx) {
+        offsetRef.current += (ctx.currentTime - startedAtRef.current) * speedRef.current;
+      }
+      teardownSource();
+      stopProgress();
       setTtsState("idle");
       return;
     }
 
     try {
       setTtsState("playing");
-      // Tier-B B1: play_tts returns raw bytes via tauri::ipc::Response, so the
-      // frontend receives an ArrayBuffer (not a JSON number[]).
-      const buffer = await invoke<ArrayBuffer>("play_tts", { text: inputText });
-      const blob = new Blob([new Uint8Array(buffer)], { type: "audio/wav" });
-      const url = URL.createObjectURL(blob);
-
-      const audio = new Audio(url);
-      audio.playbackRate = ttsSpeed;
-      audioRef.current = audio;
-
-      audio.onloadedmetadata = () => setDuration(audio.duration);
-      audio.ontimeupdate = () => {
-        setCurrentTime(audio.currentTime);
-        setProgress(audio.duration ? audio.currentTime / audio.duration : 0);
-      };
-      audio.onended = () => {
-        setTtsState("idle");
-        setProgress(0);
-        setCurrentTime(0);
-        URL.revokeObjectURL(url);
-      };
-
-      await audio.play();
+      // Resume a paused clip without re-synthesizing.
+      if (
+        bufferRef.current &&
+        offsetRef.current > 0 &&
+        offsetRef.current < bufferRef.current.duration
+      ) {
+        await getCtx().resume();
+        playFrom(offsetRef.current);
+        return;
+      }
+      // Fresh: synthesize, decode, play from the start.
+      const bytes = await invoke<ArrayBuffer>("play_tts", { text: inputText });
+      const ctx = getCtx();
+      await ctx.resume();
+      // decodeAudioData detaches its input — pass a copy.
+      const buf = await ctx.decodeAudioData(bytes.slice(0));
+      bufferRef.current = buf;
+      setDuration(buf.duration);
+      offsetRef.current = 0;
+      playFrom(0);
     } catch (e) {
       setTtsState("idle");
       addToast(String(e), "error");
@@ -58,9 +132,26 @@ export default function PlaybackControls() {
   }
 
   function handleSpeedChange(speed: number) {
+    // If playing, commit elapsed at the OLD rate, then apply the new rate live.
+    if (ttsState === "playing" && ctxRef.current && sourceRef.current) {
+      const ctx = ctxRef.current;
+      offsetRef.current += (ctx.currentTime - startedAtRef.current) * speedRef.current;
+      startedAtRef.current = ctx.currentTime;
+      sourceRef.current.playbackRate.value = speed;
+    }
+    speedRef.current = speed;
     setTtsSpeed(speed);
-    if (audioRef.current) audioRef.current.playbackRate = speed;
   }
+
+  // Clean up audio + timers on unmount.
+  useEffect(() => {
+    return () => {
+      stopProgress();
+      teardownSource();
+      ctxRef.current?.close().catch(() => {});
+      ctxRef.current = null;
+    };
+  }, []);
 
   function fmt(s: number) {
     if (!Number.isFinite(s)) return "0:00";
