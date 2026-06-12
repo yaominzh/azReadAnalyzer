@@ -137,6 +137,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "transcribe-rs",
+ "url",
 ]
 
 [[package]]
