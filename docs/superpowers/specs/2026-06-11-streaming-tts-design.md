@@ -4,6 +4,7 @@
 **Status:** Approved
 **Branch:** `260609-bugfix` (follows the settings/frost + manual-test fixes)
 **Builds on:** the current TTS path — `tts_service/server.py` (`/tts`, full-WAV), `commands.rs::play_tts` (raw bytes via `ipc::Response`), and `PlaybackControls.tsx` (Web Audio single-buffer playback).
+**Review incorporated:** [2026-06-11-streaming-tts-design-review.md](../thirdpartyreview/2026-06-11-streaming-tts-design-review.md) (Codex) — findings 1–5 evaluated/verified and applied (non-2xx handling, stale-session guard + cancellation, speed contract, underrun clamp, stronger sidecar test).
 
 ---
 
@@ -55,20 +56,25 @@ WebView (PlaybackControls)        Rust                         tts_service :8123
 
 ### 2. Rust — `play_tts_stream` command
 
-- `#[command] async fn play_tts_stream(text: String, on_chunk: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String>`.
-- reqwest `POST http://127.0.0.1:8123/tts_stream`, then `.bytes_stream()`; for each `Ok(bytes)` → `on_chunk.send(bytes_into_response_body)`. Return `Ok(())` when the stream ends (signals synthesis complete), `Err(...)` if the sidecar is unreachable or the stream errors.
-- `Cargo.toml`: add `"stream"` to the reqwest features (`["json", "stream"]`).
-- **Byte alignment:** a network chunk may split a 2-byte sample. Rust forwards bytes verbatim; the **frontend** carries a leftover odd byte across chunks (simplest single place to handle it).
-- Registered in `lib.rs` `generate_handler!`. (No `AppState` needed.)
+- `#[command] async fn play_tts_stream(text: String, on_chunk: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>, state: State<'_, Arc<AppState>>) -> Result<(), String>`.
+- reqwest `POST http://127.0.0.1:8123/tts_stream`.
+- **(review #1) Check status before streaming:** after `.send().await`, verify `resp.status().is_success()`. On a non-2xx, read a short error body and return `Err(...)` — do **not** enter `bytes_stream()`. Otherwise a 4xx/5xx JSON/text error body would be forwarded as "PCM" and the frontend would schedule garbage instead of taking the fallback. (The existing `call_tts_sidecar` omits this check — the streaming path must not copy that.)
+- Then `.bytes_stream()`; for each `Ok(bytes)` → `on_chunk.send(...)`. Return `Ok(())` when the stream ends (synthesis complete), `Err(...)` on unreachable / non-2xx / stream error.
+- **(review #2) Cancellation:** `AppState` gains `tts_gen: AtomicU64`. On entry, `let my_gen = state.tts_gen.fetch_add(1, SeqCst) + 1;` (supersedes any prior stream). The forward loop breaks as soon as `state.tts_gen.load(SeqCst) != my_gen`. Breaking drops the reqwest response → the sidecar sees the client disconnect and stops generating on its next chunk boundary (freeing it for the next request). A companion `#[command] stop_tts_stream(state)` bumps `tts_gen` so a plain Stop (no replay) also cancels.
+- `Cargo.toml`: add `"stream"` to reqwest features (`["json", "stream"]`).
+- **Byte alignment:** a network chunk may split a 2-byte sample. Rust forwards bytes verbatim; the **frontend** carries a leftover odd byte across chunks (single place to handle it).
+- Register `play_tts_stream` + `stop_tts_stream` in `lib.rs` `generate_handler!`; add `tts_gen: AtomicU64::new(0)` to the `AppState` init.
 
 ### 3. Frontend — streaming scheduler
 
 - **`src/lib/streamPlayer.ts` (new):** a small, unit-testable module owning the Web Audio scheduling, so `PlaybackControls` stays readable.
   - `createStreamPlayer(ctx, getSpeed)` → `{ pushChunk(bytes), pause(), resume(), stop(), onProgress, synthDuration }`.
-  - `pushChunk(bytes)`: append to a pending byte buffer; carry an odd trailing byte; for the whole int16 frames, build `AudioBuffer(1, n, 24000)` (int16 → float32 = `v / 32768`); `src = ctx.createBufferSource(); src.buffer = buf; src.playbackRate.value = getSpeed(); src.connect(ctx.destination); src.start(nextStartTime); nextStartTime += buf.duration / getSpeed()`. Track sources + accumulate `synthDuration`.
+  - `pushChunk(bytes)`: append to a pending byte buffer; carry an odd trailing byte; for the whole int16 frames, build `AudioBuffer(1, n, 24000)` (int16 → float32 = `v / 32768`); `src = ctx.createBufferSource(); src.buffer = buf; src.playbackRate.value = getSpeed(); src.connect(ctx.destination)`. **(review #4 — underrun clamp)** before starting, clamp the cursor to the present: `nextStartTime = Math.max(nextStartTime, ctx.currentTime + LOOKAHEAD)` (`LOOKAHEAD = 0.1 s`) so a runtime stall (GC, main-thread work, sidecar hiccup) never schedules a chunk in the past (which Web Audio would start immediately, causing an audible underrun + progress desync). Then `src.start(nextStartTime); nextStartTime += buf.duration / getSpeed()`. Track sources + accumulate `synthDuration`. (A small underrun counter may be logged for live checks.)
+  - **(review #3 — speed contract):** a speed change applies to chunks scheduled **after** it; already-queued chunks keep their scheduled rate. The timeline stays **gapless** because `nextStartTime` advances by each chunk's *actual played duration* (`buf.duration / rate-at-schedule`), so old-rate and new-rate chunks abut without gap or overlap. No re-timing of queued sources. (This is "live speed" with a tiny lag equal to the lookahead buffer — the UI reflects the change on the next scheduled chunk.)
   - **Pause/resume** = `ctx.suspend()` / `ctx.resume()` — freezes the entire scheduled timeline (no offset math).
   - **Stop** = stop all sources, reset cursor.
-- **`PlaybackControls.tsx`:** on Play, create a `Channel`, `invoke("play_tts_stream", { text, onChunk })`, feed `onmessage` chunks into the stream player. Keep one `AudioContext` for the component (created lazily). Progress bar = `ctx.currentTime`-elapsed over `synthDuration`-so-far (grows as audio arrives; exact once the stream completes). Speed select sets the rate applied to subsequently-scheduled chunks.
+- **`PlaybackControls.tsx`:** on Play, create a `Channel`, `invoke("play_tts_stream", { text, onChunk })`, feed `onmessage` chunks into the stream player. Keep one `AudioContext` for the component (created lazily). Progress bar = `ctx.currentTime`-elapsed over `synthDuration`-so-far (grows as audio arrives; exact once the stream completes). Speed select updates the rate applied to subsequently-scheduled chunks (see speed contract above).
+- **(review #2 — stale-session guard):** `PlaybackControls` holds an incrementing `playbackSessionId` ref. Each Play starts a **new** session (bump id) + a fresh `Channel`. Every `onmessage` chunk handler, the invoke completion handler, and the error handler first checks `session === currentSessionId` and **no-ops** if stale — so chunks/results from a superseded stream never schedule audio, reset state, or toast. **Stop / replay / new-text / unmount** invalidate the session (bump id), tear down the stream player's sources, and `invoke("stop_tts_stream")` to cancel the backend (which frees the sidecar).
 - **Fallback:** if `play_tts_stream` rejects before any chunk arrives (sidecar down / stream error), call the existing `play_tts` full-WAV path (single-buffer Web Audio playback already implemented). `play_tts` and `/tts` remain.
 
 ---
@@ -77,15 +83,17 @@ WebView (PlaybackControls)        Rust                         tts_service :8123
 
 | Scenario | Handling |
 |----------|----------|
-| Sidecar unreachable (stream) | `play_tts_stream` → `Err` → fallback to `play_tts`; if that also fails → existing "TTS service not running" toast |
-| Mid-stream failure | stop scheduling, toast; audio already played is left intact; reset to idle |
+| Sidecar unreachable (stream) | `play_tts_stream` → `Err` before any chunk → fallback to `play_tts`; if that also fails → existing "TTS service not running" toast |
+| Sidecar returns non-2xx (review #1) | status checked before `bytes_stream()` → `Err` (short error body) → fallback. The error body is never forwarded as PCM. |
+| Mid-stream failure (after chunks played) | stop scheduling, toast; audio already played is left intact; reset to idle; **no** fallback (would double-play) |
+| Stop / replay / new-text / unmount mid-stream (review #2) | bump `playbackSessionId` + `stop_tts_stream`; stale chunks/results no-op; sidecar cancels |
 | Empty/whitespace text | Play disabled (unchanged) |
 | User pauses then plays | `ctx.suspend()`/`resume()`; replay after natural end re-streams from the start |
 
 ## Testing
 
-- **Sidecar:** a script (formalizing the feasibility probe) asserting `/tts_stream` yields chunks incrementally — first chunk arrives well before full-synth time.
-- **Rust:** `play_tts_stream` returns `Err` when the sidecar is unreachable (mirrors the existing `llm::returns_err_when_llm_unreachable` test). Forwarding is covered by the live check.
+- **Sidecar (review #5 — assert the wire contract):** a script that hits `/tts_stream` and asserts: **200** status; a documented raw-PCM media type (e.g. `application/octet-stream` or `audio/L16;rate=24000`); **first-chunk latency** « full-synth time; **multiple chunks** for a longer passage; **even** total byte count (int16 framing); and a **non-empty** total. This guards against the endpoint silently returning an error body or malformed PCM.
+- **Rust:** `play_tts_stream` returns `Err` when the sidecar is unreachable, and (review #1) when it returns a non-2xx status (mirrors the existing `llm::returns_err_when_llm_unreachable` test). Chunk forwarding + cancellation are covered by the live check.
 - **Frontend:** unit tests for `streamPlayer`'s PCM-frame assembler — odd-byte carry across chunks, int16→float32 conversion, and that `pushChunk` schedules a buffer per complete frame set. (AudioContext is mocked/guarded in jsdom; the chunk-math is the testable core.)
 - **Existing:** the non-streaming `play_tts` tests and `PlaybackControls` render tests stay green.
 - **Live (by ear):** first-sound latency ~0.2–0.3 s on a paragraph; gapless playback; pause/resume; speed; fallback when the sidecar is stopped.
@@ -101,7 +109,7 @@ WebView (PlaybackControls)        Rust                         tts_service :8123
 
 - `tts_service/server.py` — add `POST /tts_stream` (async generator over `model.generate(stream=True)`, int16 PCM).
 - `src-tauri/Cargo.toml` — reqwest `"stream"` feature.
-- `src-tauri/src/commands.rs` — `play_tts_stream` command (reqwest `bytes_stream` → `Channel.send`).
-- `src-tauri/src/lib.rs` — register `play_tts_stream`.
+- `src-tauri/src/commands.rs` — `play_tts_stream` (status check → reqwest `bytes_stream` → `Channel.send`, generation-gated) + `stop_tts_stream`; `AppState.tts_gen: AtomicU64`.
+- `src-tauri/src/lib.rs` — register `play_tts_stream` + `stop_tts_stream`; init `tts_gen`.
 - `src/lib/streamPlayer.ts` (new) + `src/lib/streamPlayer.test.ts` (new) — Web Audio chunk scheduler + frame-assembly tests.
 - `src/components/PlaybackControls.tsx` — Channel wiring, streaming play with `play_tts` fallback; keep pause/speed/progress.
