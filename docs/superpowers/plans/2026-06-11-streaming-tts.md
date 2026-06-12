@@ -246,7 +246,7 @@ In `generate_handler!`, add:
             commands::stop_tts_stream,
 ```
 
-- [ ] **Step 5: Add Rust tests (review #4)** — append this `#[cfg(test)]` module at the end of `src-tauri/src/commands.rs`. It covers the two specified failure modes without needing a fake server: `ensure_success` returns `Err` on non-2xx (the "never forward an error body as PCM" guarantee), and a POST to a dead port errors before any send.
+- [ ] **Step 5: Add a Rust test (review #4)** — append this `#[cfg(test)]` module at the end of `src-tauri/src/commands.rs`. It **deterministically** covers the core contract — non-2xx → `Err` (the "never forward an error body as PCM" guarantee). (The unreachable→`Err` path is the same `reqwest::send()` behavior already proven by `llm::returns_err_when_llm_unreachable` and the live fallback check; we avoid a duplicate dead-port network test, which would be non-deterministic if that port were ever bound — the reviewer's `TcpListener`-to-0 alternative has its own bind/connect race, so a pure unit test is the better call.)
 ```rust
 #[cfg(test)]
 mod stream_tests {
@@ -257,19 +257,6 @@ mod stream_tests {
         assert!(ensure_success(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom").is_err());
         assert!(ensure_success(reqwest::StatusCode::NOT_FOUND, "").is_err());
         assert!(ensure_success(reqwest::StatusCode::OK, "").is_ok());
-    }
-
-    #[tokio::test]
-    async fn stream_post_to_dead_port_errors() {
-        // Mirrors llm::returns_err_when_llm_unreachable: send() fails before any
-        // chunk is forwarded, so play_tts_stream returns Err → frontend falls back.
-        let client = reqwest::Client::new();
-        let r = client
-            .post("http://127.0.0.1:19998/tts_stream")
-            .json(&serde_json::json!({ "text": "x" }))
-            .send()
-            .await;
-        assert!(r.is_err());
     }
 }
 ```
@@ -515,6 +502,7 @@ export default function PlaybackControls() {
   speedRef.current = ttsSpeed;
   const rafRef = useRef<number | null>(null);
   const streamDoneRef = useRef(false); // true once the stream has fully arrived
+  const playbackTextRef = useRef(""); // text the current playback was made from
 
   // Fallback (single-buffer) state.
   const fbSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -561,6 +549,10 @@ export default function PlaybackControls() {
     rafRef.current = requestAnimationFrame(tick);
   }
 
+  // Local teardown only. Does NOT cancel the backend: a fresh play_tts_stream
+  // supersedes the prior stream via tts_gen, and calling stop_tts_stream then
+  // immediately starting a new stream would race (the stop could cancel the new
+  // one). Backend cancellation happens only on unmount (see the effect). (review #1)
   function teardown() {
     sessionRef.current++;           // invalidate any in-flight session
     stopProgress();
@@ -571,7 +563,6 @@ export default function PlaybackControls() {
       fbSourceRef.current.disconnect();
       fbSourceRef.current = null;
     }
-    invoke("stop_tts_stream").catch(() => {});
   }
 
   async function handlePlay() {
@@ -582,17 +573,23 @@ export default function PlaybackControls() {
       setTtsState("idle");
       return;
     }
-    // resume a paused clip (streaming or fallback) without re-synthesizing.
-    if (ctxRef.current && ctxRef.current.state === "suspended") {
+    // Resume a paused clip (streaming or fallback) without re-synthesizing —
+    // but only if the text hasn't changed since it was made (review #2).
+    if (
+      ctxRef.current &&
+      ctxRef.current.state === "suspended" &&
+      playbackTextRef.current === inputText
+    ) {
       await ctxRef.current.resume();
       startProgress();
       setTtsState("playing");
       return;
     }
 
-    // Fresh playback.
+    // Fresh playback (new text, or first play, or finished).
     teardown();
     const session = ++sessionRef.current;
+    playbackTextRef.current = inputText;
     setTtsState("playing");
     setProgress(0); setCurrentTime(0); setDuration(0);
     streamDoneRef.current = false;
@@ -640,18 +637,25 @@ export default function PlaybackControls() {
       src.buffer = buf;
       src.playbackRate.value = speedRef.current;
       src.connect(ctx.destination);
-      src.onended = () => { if (session === sessionRef.current) { stopProgress(); setTtsState("idle"); } };
       fbSourceRef.current = src;
-      setDuration(buf.duration);
-      const startedAt = ctx.currentTime;
-      stopProgress();
-      const tick = () => {
-        const cur = Math.min(ctx.currentTime - startedAt, buf.duration);
-        setCurrentTime(cur); setProgress(buf.duration ? cur / buf.duration : 0);
-        if (cur < buf.duration) rafRef.current = requestAnimationFrame(tick);
+
+      const startAt = ctx.currentTime + 0.05;
+      src.start(startAt);
+      src.onended = () => { if (session === sessionRef.current) { stopProgress(); setProgress(1); setTtsState("idle"); } };
+
+      // Expose the fallback as a player so progress + resume use the SAME ctx-time
+      // path as streaming (review #3 — resume no longer reads a stale empty player).
+      playerRef.current = {
+        pushChunk() {},
+        pause() { ctx.suspend(); },
+        resume() { ctx.resume(); },
+        stop() { try { src.stop(); } catch { /* noop */ } src.disconnect(); },
+        synthDuration: () => buf.duration,
+        playbackStartTime: () => startAt,
+        playbackEndTime: () => startAt + buf.duration / speedRef.current,
       };
-      src.start(0);
-      rafRef.current = requestAnimationFrame(tick);
+      streamDoneRef.current = true; // fallback audio is fully available
+      startProgress();
     } catch (e) {
       if (session === sessionRef.current) { setTtsState("idle"); addToast(String(e), "error"); }
     }
@@ -665,7 +669,12 @@ export default function PlaybackControls() {
     if (fbSourceRef.current) fbSourceRef.current.playbackRate.value = speed;
   }
 
-  useEffect(() => () => { teardown(); ctxRef.current?.close().catch(() => {}); ctxRef.current = null; }, []);
+  useEffect(() => () => {
+    teardown();
+    invoke("stop_tts_stream").catch(() => {}); // cancel any in-flight backend stream on unmount
+    ctxRef.current?.close().catch(() => {});
+    ctxRef.current = null;
+  }, []);
 
   function fmt(s: number) {
     if (!Number.isFinite(s)) return "0:00";
@@ -755,4 +764,5 @@ git commit -m "feat(tts): streaming playback with session guard + play_tts fallb
 - **Spec coverage:** sidecar `/tts_stream` (Task 1); reqwest `stream`+`futures-util`, `play_tts_stream` status-check + gen-cancel, `stop_tts_stream`, `AppState.tts_gen` (Task 2); `streamPlayer` frame assembler + clamp + pause/resume/stop (Task 3); Channel wiring + session guard + speed contract + fallback + progress (Task 4). Review findings #1 (status check), #2 (session guard + tts_gen + stop_tts_stream), #3 (speed contract — `speedRef`, applies to new chunks), #4 (LOOKAHEAD clamp in pushChunk), #5 (contract test) all present.
 - **Types consistent:** `Channel<ArrayBuffer>` (JS) ↔ `Channel<InvokeResponseBody>` send `Raw(Vec<u8>)` → ArrayBuffer; `createStreamPlayer(ctx, getSpeed) -> StreamPlayer { pushChunk, pause, resume, stop, synthDuration }` used exactly in PlaybackControls; `play_tts_stream({ text, onChunk })` arg names match the Rust params (`text`, `on_chunk` → JS `onChunk`).
 - **Note:** Tauri maps the Rust param `on_chunk` to JS key `onChunk` (camelCase). The invoke uses `{ text, onChunk }`.
-- **Plan-review (Codex 2026-06-11) findings applied:** #1 progress/completion via ctx-time bounds (`playbackStartTime`/`playbackEndTime`) — correct under pause/resume + speed; #2 Vitest mock exports `Channel` + resolves the new commands; #3 speed contract documented honestly (set-before-Play; mid-play lag; horizon deferred); #4 `ensure_success` helper + real non-2xx / dead-port tests (not compile-only); #5 `requests` added to sidecar requirements.
+- **Plan-review 1 (Codex 2026-06-11) findings applied:** #1 progress/completion via ctx-time bounds (`playbackStartTime`/`playbackEndTime`) — correct under pause/resume + speed; #2 Vitest mock exports `Channel` + resolves the new commands; #3 speed contract documented honestly (set-before-Play; mid-play lag; horizon deferred); #4 `ensure_success` helper + deterministic non-2xx test; #5 `requests` added to sidecar requirements.
+- **Plan-review 2 (Codex 2026-06-11) findings applied:** #1 backend cancel removed from `teardown()` (a fresh `play_tts_stream` supersedes via `tts_gen`; `stop_tts_stream` only on unmount) — fixes the stop/start race; #2 `playbackTextRef` guard so resume only continues matching text, else fresh; #3 fallback exposed as a unified player object so resume uses the ctx-time progress path; #4 dropped the flaky dead-port network test in favor of the deterministic `ensure_success` test (the suggested `TcpListener`-0 fix has its own race).
