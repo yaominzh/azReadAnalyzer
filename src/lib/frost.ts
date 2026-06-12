@@ -6,7 +6,7 @@ export interface Frost {
 export const FROST_DEFAULT: Frost = { alpha: 0.55, blur: 16 };
 
 export const FROST_PRESETS = {
-  Solid: { alpha: 0.95, blur: 0 },
+  Solid: { alpha: 1.0, blur: 0 }, // fully opaque — no desktop showing through
   Frosted: { alpha: 0.55, blur: 16 },
   Glass: { alpha: 0.25, blur: 28 },
 } as const satisfies Record<string, Frost>;
@@ -14,7 +14,7 @@ export const FROST_PRESETS = {
 const KEY_ALPHA = "az.frost.alpha";
 const KEY_BLUR = "az.frost.blur";
 
-export const clampAlpha = (n: number): number => Math.min(0.95, Math.max(0.05, n));
+export const clampAlpha = (n: number): number => Math.min(1, Math.max(0.05, n));
 export const clampBlur = (n: number): number => Math.min(40, Math.max(0, n));
 
 export function loadFrost(): Frost {

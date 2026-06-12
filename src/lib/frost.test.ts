@@ -5,7 +5,7 @@ describe("frost", () => {
   beforeEach(() => localStorage.clear());
 
   it("clamps alpha and blur to range", () => {
-    expect(clampAlpha(2)).toBe(0.95);
+    expect(clampAlpha(2)).toBe(1);
     expect(clampAlpha(0)).toBe(0.05);
     expect(clampBlur(99)).toBe(40);
     expect(clampBlur(-5)).toBe(0);
@@ -23,7 +23,7 @@ describe("frost", () => {
 
   it("saveFrost persists clamped values and loadFrost reads them", () => {
     saveFrost({ alpha: 2, blur: 99 });
-    expect(loadFrost()).toEqual({ alpha: 0.95, blur: 40 });
+    expect(loadFrost()).toEqual({ alpha: 1, blur: 40 });
   });
 
   it("Frosted preset equals the default", () => {

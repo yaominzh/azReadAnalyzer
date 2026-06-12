@@ -86,7 +86,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
           <summary className="text-[11px] text-white/45 cursor-pointer select-none">Advanced</summary>
           <label className="block text-[11px] text-white/45 mt-2 mb-3">
             Opacity {Math.round(frost.alpha * 100)}%
-            <input type="range" min={5} max={95} value={Math.round(frost.alpha * 100)}
+            <input type="range" min={5} max={100} value={Math.round(frost.alpha * 100)}
               onChange={(e) => setAlpha(Number(e.target.value) / 100)} className="w-full" />
           </label>
           <label className="block text-[11px] text-white/45 mb-2">
