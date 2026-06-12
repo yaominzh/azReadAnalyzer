@@ -32,6 +32,7 @@ pub fn run() {
             last_recording_wav: Mutex::new(None),
             last_capture_png: Mutex::new(None),
             settings: Mutex::new(settings::AppSettings::load()),
+            tts_gen: std::sync::atomic::AtomicU64::new(0),
         }))
         .invoke_handler(tauri::generate_handler![
             commands::paste_clipboard,
@@ -45,6 +46,8 @@ pub fn run() {
             commands::stop_recording,
             commands::get_settings,
             commands::apply_settings,
+            commands::play_tts_stream,
+            commands::stop_tts_stream,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

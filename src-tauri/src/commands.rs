@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{command, AppHandle, State};
+use futures_util::StreamExt;
 
 use crate::audio::Recorder;
 use crate::stt::WhisperEngine;
@@ -17,6 +19,9 @@ pub struct AppState {
     // User settings (LLM/oMLX connection), loaded at startup, edited via the
     // Settings panel. Persisted to ~/.azreadanalyzer/settings.json.
     pub settings: Mutex<crate::settings::AppSettings>,
+    // Generation counter for streaming TTS. Bumped on each new stream and on
+    // stop; an in-flight play_tts_stream loop exits when it's superseded.
+    pub tts_gen: AtomicU64,
 }
 
 // SAFETY: Recorder holds cpal::Stream which is not Send, but access is
@@ -114,6 +119,63 @@ pub async fn capture_screenshot(
 pub async fn play_tts(text: String) -> Result<tauri::ipc::Response, String> {
     let bytes = crate::capture::call_tts_sidecar(&text).await?;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Map a sidecar HTTP status + body to a result (review #1/#4 — never forward an
+/// error body as PCM). Extracted so the non-2xx branch is unit-testable.
+fn ensure_success(status: reqwest::StatusCode, body: &str) -> Result<(), String> {
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("TTS stream error: {body}"))
+    }
+}
+
+/// Streams TTS audio chunks (int16 PCM) from the sidecar to the frontend via a
+/// Tauri Channel. Status-checked (never forwards an error body as audio) and
+/// generation-gated (a newer stream or stop_tts_stream supersedes this one,
+/// which drops the response and disconnects the sidecar).
+#[command]
+pub async fn play_tts_stream(
+    text: String,
+    on_chunk: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let my_gen = state.tts_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://127.0.0.1:8123/tts_stream")
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .map_err(|_| "TTS service not running — start tts_service/".to_string())?;
+
+    if let Err(e) = ensure_success(resp.status(), "") {
+        // read a short body for context, then fail — do NOT enter bytes_stream().
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(if detail.is_empty() { e } else { format!("TTS stream error: {detail}") });
+    }
+
+    let mut stream = resp.bytes_stream();
+    while let Some(item) = stream.next().await {
+        // Superseded → stop. Dropping `stream`/`resp` disconnects the sidecar.
+        if state.tts_gen.load(Ordering::SeqCst) != my_gen {
+            return Ok(());
+        }
+        let bytes = item.map_err(|e| e.to_string())?;
+        on_chunk
+            .send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec()))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Cancels any in-flight streaming TTS (used by Stop / replace / unmount).
+#[command]
+pub fn stop_tts_stream(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.tts_gen.fetch_add(1, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Returns the last recording's WAV bytes for replay (#3), via the same
@@ -256,4 +318,16 @@ pub fn apply_settings(
     let mut g = state.settings.lock().map_err(|e| e.to_string())?;
     *g = settings; // only update memory after a successful write
     Ok(())
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::ensure_success;
+
+    #[test]
+    fn non_2xx_is_err() {
+        assert!(ensure_success(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom").is_err());
+        assert!(ensure_success(reqwest::StatusCode::NOT_FOUND, "").is_err());
+        assert!(ensure_success(reqwest::StatusCode::OK, "").is_ok());
+    }
 }
