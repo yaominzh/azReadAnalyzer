@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/useAppStore";
+import { createStreamPlayer, type StreamPlayer } from "../lib/streamPlayer";
 
 const SPEEDS = [0.75, 1.0, 1.25, 1.5, 2.0];
 
@@ -12,23 +13,22 @@ export default function PlaybackControls() {
   const setTtsState = useAppStore((s) => s.setTtsState);
   const addToast = useAppStore((s) => s.addToast);
 
-  // Playback via the Web Audio API (decodeAudioData + AudioBufferSourceNode).
-  // The WebView <audio> element renders this 24kHz TTS WAV with a robotic /
-  // "machinery" timbre, even though the identical bytes play cleanly natively;
-  // Web Audio decodes + resamples with the high-quality path and fixes it.
   const ctxRef = useRef<AudioContext | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const bufferRef = useRef<AudioBuffer | null>(null);
-  const startedAtRef = useRef(0);    // ctx time when the current segment started
-  const offsetRef = useRef(0);       // buffer offset (s) the current segment started at
-  const rafRef = useRef<number | null>(null);
-  const stoppingRef = useRef(false); // true => the next onended is a manual stop/replace
-  const speedRef = useRef(ttsSpeed); // mirror of ttsSpeed for the rAF/commit math
+  const playerRef = useRef<StreamPlayer | null>(null);
+  const sessionRef = useRef(0);
+  const speedRef = useRef(ttsSpeed);
+  // eslint-disable-next-line react-hooks/refs -- intentional latest-value mirror for callbacks
   speedRef.current = ttsSpeed;
+  const rafRef = useRef<number | null>(null);
+  const streamDoneRef = useRef(false); // true once the stream has fully arrived
+  const playbackTextRef = useRef(""); // text the current playback was made from
+
+  // Fallback (single-buffer) state.
+  const fbSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
   const [progress, setProgress] = useState(0);
-  const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
 
   const disabled = !inputText.trim();
 
@@ -38,119 +38,162 @@ export default function PlaybackControls() {
   }
 
   function stopProgress() {
-    if (rafRef.current != null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
+    if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
   }
 
-  function teardownSource() {
-    if (sourceRef.current) {
-      stoppingRef.current = true;
-      try { sourceRef.current.stop(); } catch { /* already stopped */ }
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
-  }
-
-  function tick() {
+  // Progress/completion are driven by the audio timeline (ctx-time bounds from
+  // the player), so they're correct under pause/resume (ctx.currentTime freezes
+  // on suspend) and any playback speed (end already accounts for per-chunk rate).
+  function startProgress() {
     const ctx = ctxRef.current;
-    const buf = bufferRef.current;
-    if (!ctx || !buf) return;
-    const cur = offsetRef.current + (ctx.currentTime - startedAtRef.current) * speedRef.current;
-    const clamped = Math.min(cur, buf.duration);
-    setCurrentTime(clamped);
-    setProgress(buf.duration ? clamped / buf.duration : 0);
-    if (cur < buf.duration) rafRef.current = requestAnimationFrame(tick);
-  }
-
-  function playFrom(offset: number) {
-    const ctx = getCtx();
-    const buf = bufferRef.current;
-    if (!buf) return;
-    teardownSource();
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.playbackRate.value = speedRef.current;
-    src.connect(ctx.destination);
-    src.onended = () => {
-      if (stoppingRef.current) { stoppingRef.current = false; return; } // manual stop/replace
-      stopProgress();
-      offsetRef.current = 0;
-      setProgress(0);
-      setCurrentTime(0);
-      setTtsState("idle");
-    };
-    stoppingRef.current = false;
-    src.start(0, offset);
-    sourceRef.current = src;
-    startedAtRef.current = ctx.currentTime;
-    offsetRef.current = offset;
+    const player = playerRef.current;
+    function tick() {
+      if (!ctx || !player) return;
+      const synth = player.synthDuration();
+      const start = player.playbackStartTime();
+      const end = player.playbackEndTime();
+      setDuration(synth);
+      if (start != null && end > start) {
+        const p = Math.min(1, Math.max(0, (ctx.currentTime - start) / (end - start)));
+        setProgress(p);
+        setCurrentTime(p * synth);
+        // Stream fully arrived AND its scheduled audio has played out → done.
+        if (streamDoneRef.current && ctx.currentTime >= end - 0.02) {
+          stopProgress(); setProgress(1); setCurrentTime(synth); setTtsState("idle"); return;
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    }
     stopProgress();
     rafRef.current = requestAnimationFrame(tick);
   }
 
+  // Local teardown only. Does NOT cancel the backend: a fresh play_tts_stream
+  // supersedes the prior stream via tts_gen, and calling stop_tts_stream then
+  // immediately starting a new stream would race (the stop could cancel the new
+  // one). Backend cancellation happens only on unmount (see the effect). (review #1)
+  function teardown() {
+    sessionRef.current++;           // invalidate any in-flight session
+    stopProgress();
+    playerRef.current?.stop();
+    playerRef.current = null;
+    if (fbSourceRef.current) {
+      try { fbSourceRef.current.stop(); } catch { /* noop */ }
+      fbSourceRef.current.disconnect();
+      fbSourceRef.current = null;
+    }
+  }
+
   async function handlePlay() {
     if (ttsState === "playing") {
-      // Pause: remember the position, stop the source.
-      const ctx = ctxRef.current;
-      if (ctx) {
-        offsetRef.current += (ctx.currentTime - startedAtRef.current) * speedRef.current;
-      }
-      teardownSource();
+      // pause: freeze the whole scheduled timeline.
+      ctxRef.current?.suspend().catch(() => {});
       stopProgress();
       setTtsState("idle");
       return;
     }
-
-    try {
+    // Resume a paused clip (streaming or fallback) without re-synthesizing —
+    // but only if the text hasn't changed since it was made (review #2).
+    if (
+      ctxRef.current &&
+      ctxRef.current.state === "suspended" &&
+      playbackTextRef.current === inputText
+    ) {
+      await ctxRef.current.resume();
+      startProgress();
       setTtsState("playing");
-      // Resume a paused clip without re-synthesizing.
-      if (
-        bufferRef.current &&
-        offsetRef.current > 0 &&
-        offsetRef.current < bufferRef.current.duration
-      ) {
-        await getCtx().resume();
-        playFrom(offsetRef.current);
-        return;
+      return;
+    }
+
+    // Fresh playback (new text, or first play, or finished).
+    teardown();
+    const session = ++sessionRef.current;
+    playbackTextRef.current = inputText;
+    setTtsState("playing");
+    setProgress(0); setCurrentTime(0); setDuration(0);
+    streamDoneRef.current = false;
+
+    const ctx = getCtx();
+    await ctx.resume();
+    const player = createStreamPlayer(ctx, () => speedRef.current);
+    playerRef.current = player;
+    let received = false;
+
+    const onChunk = new Channel<ArrayBuffer>();
+    onChunk.onmessage = (chunk) => {
+      if (session !== sessionRef.current) return; // stale
+      received = true;
+      player.pushChunk(chunk);
+    };
+
+    startProgress();
+    try {
+      await invoke("play_tts_stream", { text: inputText, onChunk });
+      // Stream fully arrived; the progress tick flips to idle once it plays out.
+      if (session === sessionRef.current) streamDoneRef.current = true;
+    } catch (e) {
+      if (session !== sessionRef.current) return; // stale
+      if (!received) {
+        await playFallback(session); // sidecar down / non-2xx before any audio
+      } else {
+        stopProgress();
+        setTtsState("idle");
+        addToast(String(e), "error");
       }
-      // Fresh: synthesize, decode, play from the start.
+    }
+  }
+
+  // Fallback: the existing full-WAV path via play_tts (single buffer).
+  async function playFallback(session: number) {
+    try {
       const bytes = await invoke<ArrayBuffer>("play_tts", { text: inputText });
+      if (session !== sessionRef.current) return;
       const ctx = getCtx();
       await ctx.resume();
-      // decodeAudioData detaches its input — pass a copy.
       const buf = await ctx.decodeAudioData(bytes.slice(0));
-      bufferRef.current = buf;
-      setDuration(buf.duration);
-      offsetRef.current = 0;
-      playFrom(0);
+      if (session !== sessionRef.current) return;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.playbackRate.value = speedRef.current;
+      src.connect(ctx.destination);
+      fbSourceRef.current = src;
+
+      const startAt = ctx.currentTime + 0.05;
+      src.start(startAt);
+      src.onended = () => { if (session === sessionRef.current) { stopProgress(); setProgress(1); setTtsState("idle"); } };
+
+      // Expose the fallback as a player so progress + resume use the SAME ctx-time
+      // path as streaming (review #3 — resume no longer reads a stale empty player).
+      playerRef.current = {
+        pushChunk() {},
+        pause() { ctx.suspend(); },
+        resume() { ctx.resume(); },
+        stop() { try { src.stop(); } catch { /* noop */ } src.disconnect(); },
+        synthDuration: () => buf.duration,
+        playbackStartTime: () => startAt,
+        playbackEndTime: () => startAt + buf.duration / speedRef.current,
+      };
+      streamDoneRef.current = true; // fallback audio is fully available
+      startProgress();
     } catch (e) {
-      setTtsState("idle");
-      addToast(String(e), "error");
+      if (session === sessionRef.current) { setTtsState("idle"); addToast(String(e), "error"); }
     }
   }
 
   function handleSpeedChange(speed: number) {
-    // If playing, commit elapsed at the OLD rate, then apply the new rate live.
-    if (ttsState === "playing" && ctxRef.current && sourceRef.current) {
-      const ctx = ctxRef.current;
-      offsetRef.current += (ctx.currentTime - startedAtRef.current) * speedRef.current;
-      startedAtRef.current = ctx.currentTime;
-      sourceRef.current.playbackRate.value = speed;
-    }
     speedRef.current = speed;
     setTtsSpeed(speed);
+    // Streaming: applies to chunks scheduled hereafter (see spec speed contract).
+    // Fallback single source: update live.
+    if (fbSourceRef.current) fbSourceRef.current.playbackRate.value = speed;
   }
 
-  // Clean up audio + timers on unmount.
-  useEffect(() => {
-    return () => {
-      stopProgress();
-      teardownSource();
-      ctxRef.current?.close().catch(() => {});
-      ctxRef.current = null;
-    };
+  useEffect(() => () => {
+    teardown();
+    invoke("stop_tts_stream").catch(() => {}); // cancel any in-flight backend stream on unmount
+    ctxRef.current?.close().catch(() => {});
+    ctxRef.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unmount-only cleanup; teardown is stable
   }, []);
 
   function fmt(s: number) {
@@ -165,7 +208,6 @@ export default function PlaybackControls() {
         Listen
       </p>
       <div className="flex items-center gap-3">
-        {/* Play/Pause */}
         <button
           aria-label={ttsState === "playing" ? "Pause" : "Play"}
           onClick={handlePlay}
@@ -183,7 +225,6 @@ export default function PlaybackControls() {
           )}
         </button>
 
-        {/* Progress */}
         <div className="flex-1 h-[3px] bg-white/10 rounded-full overflow-hidden">
           <div
             className="h-full bg-gradient-to-r from-indigo-500 to-indigo-400 rounded-full transition-all"
@@ -195,7 +236,6 @@ export default function PlaybackControls() {
           {fmt(currentTime)} / {fmt(duration)}
         </span>
 
-        {/* Speed */}
         <select
           aria-label="Playback speed"
           value={ttsSpeed}
