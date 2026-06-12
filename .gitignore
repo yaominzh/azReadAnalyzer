@@ -7,3 +7,7 @@ src-tauri/target/
 /tmp/az_*.png
 ocr_service/.venv/
 tts_service/.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
