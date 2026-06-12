@@ -1,26 +1,43 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/useAppStore";
+import { loadCaptureImage } from "../lib/loadCaptureImage";
+import type { PasteResult } from "../types";
 
 export default function CaptureControls() {
   const addToast = useAppStore((s) => s.addToast);
   const setInputText = useAppStore((s) => s.setInputText);
   const clearFeedback = useAppStore((s) => s.clearFeedback);
+  const clearCaptureImage = useAppStore((s) => s.clearCaptureImage);
 
   async function handleScreenshot() {
+    // capture_screenshot emits text-captured (with hasImage) → useTauriEvents
+    // loads the thumbnail; no extra handling needed here.
     try {
       await invoke("capture_screenshot");
     } catch (e) {
-      if (String(e) !== "Screenshot cancelled") {
-        addToast(String(e), "error");
+      const msg = String(e);
+      if (msg === "Screenshot cancelled") {
+        // user pressed Esc / drew nothing — silent, expected.
+      } else if (msg.includes("permission denied")) {
+        addToast(
+          "Screen Recording permission needed — enable it in System Settings → Privacy & Security → Screen Recording, then relaunch.",
+          "error"
+        );
+      } else {
+        addToast(msg, "error");
       }
     }
   }
 
   async function handlePaste() {
     try {
-      const text = await invoke<string>("paste_clipboard");
-      setInputText(text);
+      const r = await invoke<PasteResult>("paste_clipboard");
+      setInputText(r.text);
+      if (r.hasImage) loadCaptureImage();
+      else clearCaptureImage();
     } catch (e) {
+      // Failed paste → no thumbnail (matches spec; QA D2).
+      clearCaptureImage();
       addToast(String(e), "error");
     }
   }
@@ -28,6 +45,8 @@ export default function CaptureControls() {
   function handleClear() {
     setInputText("");
     clearFeedback();
+    clearCaptureImage();
+    invoke("clear_session_media").catch(() => {});
   }
 
   const btn =

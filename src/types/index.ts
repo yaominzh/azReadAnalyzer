@@ -39,9 +39,16 @@ export interface FeedbackResult {
   comments: LlmComment[];
 }
 
+// Result of the paste_clipboard command (#4)
+export interface PasteResult {
+  text: string;
+  hasImage: boolean;
+}
+
 // Tauri IPC event payloads
 export interface TextCapturedPayload {
   text: string;
+  hasImage: boolean;
 }
 
 export interface AudioLevelPayload {
@@ -65,4 +72,12 @@ export interface Toast {
   id: string;
   message: string;
   type: "error" | "info";
+}
+
+// LLM connection settings (Rust AppSettings, camelCase serde) (#settings)
+export interface AppSettings {
+  llmBaseUrl: string;
+  llmModel: string;
+  llmApiKey: string;
+  llmTimeoutSecs: number;
 }

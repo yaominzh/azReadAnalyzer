@@ -19,9 +19,11 @@ def _run_vision_ocr(image_path: str) -> str:
     url = NSURL.fileURLWithPath_(image_path)
     handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
     request = Vision.VNRecognizeTextRequest.alloc().init()
-    # VNRequestTextRecognitionLevelAccurate = 1
-    request.setRecognitionLevel_(1)
+    # Accurate = 0, Fast = 1. Use Accurate — Fast yields character-soup on
+    # small/anti-aliased UI text. (Previously set to 1/Fast by mistake.)
+    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
     request.setUsesLanguageCorrection_(True)
+    request.setRecognitionLanguages_(["en-US"])
 
     success, error = handler.performRequests_error_([request], None)
     if not success:

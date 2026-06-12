@@ -14,7 +14,9 @@
 }
 
 body {
-  background: #080808;
+  /* Transparent so the macOS desktop shows through the frosted-glass card
+     (window is transparent + macOSPrivateApi). */
+  background: transparent;
   color: #e8e8e8;
   font-family: var(--font-family-sans);
   margin: 0;
@@ -31,9 +33,21 @@ textarea, input {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 
-.titlebar {
-  -webkit-app-region: drag;
+/* Window dragging now uses data-tauri-drag-region on the titlebar (the
+   -webkit-app-region approach is unreliable in Tauri). */
+
+:root {
+  --az-bg-alpha: 0.55;   /* Frosted preset default */
+  --az-blur: 16px;
 }
-button, select, input, textarea, a {
-  -webkit-app-region: no-drag;
+
+/* Single frosted-glass layer — the desktop shows through, blurred. */
+.az-frost {
+  background: rgba(8, 8, 8, var(--az-bg-alpha, 0.55));
+  -webkit-backdrop-filter: blur(var(--az-blur, 16px));
+  backdrop-filter: blur(var(--az-blur, 16px));
+}
+/* Legibility fallback if backdrop-filter is unsupported. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .az-frost { background: rgba(8, 8, 8, 0.92); }
 }

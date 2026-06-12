@@ -10,9 +10,21 @@ export function useMockEvents() {
 
     const store = useAppStore.getState();
 
-    // Simulate text capture after 800ms
+    // A tiny inline SVG data URL stands in for a captured screenshot so the
+    // thumbnail + lightbox (#4) are exercisable in mock mode without Rust.
+    const SAMPLE_IMAGE =
+      "data:image/svg+xml;utf8," +
+      encodeURIComponent(
+        `<svg xmlns='http://www.w3.org/2000/svg' width='320' height='180'>
+           <rect width='320' height='180' fill='#1e1b4b'/>
+           <text x='20' y='100' fill='#a5b4fc' font-family='sans-serif' font-size='20'>captured screenshot</text>
+         </svg>`
+      );
+
+    // Simulate text capture (with a thumbnail) after 800ms
     const t1 = setTimeout(() => {
       store.setInputText(SAMPLE_TEXT);
+      store.setCaptureImageUrl(SAMPLE_IMAGE);
     }, 800);
 
     // Simulate feedback after 3s

@@ -1,3 +1,4 @@
 mlx_audio
 fastapi
 uvicorn
+requests

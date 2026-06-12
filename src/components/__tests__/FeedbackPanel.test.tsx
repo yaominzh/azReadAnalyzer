@@ -57,6 +57,12 @@ describe("FeedbackPanel", () => {
     expect(screen.getByText(/150–170 wpm/)).toBeInTheDocument();
   });
 
+  it("shows the 'Your reading' replay button when feedback exists", () => {
+    useAppStore.setState({ feedback: MOCK_FEEDBACK });
+    render(<FeedbackPanel />);
+    expect(screen.getByRole("button", { name: /your reading/i })).toBeInTheDocument();
+  });
+
   it("de-emphasizes pause metrics when pausesReliable is false", () => {
     useAppStore.setState({
       feedback: { ...MOCK_FEEDBACK, pacing: { ...MOCK_FEEDBACK.pacing, pausesReliable: false } },
