@@ -15,8 +15,16 @@ export default function CaptureControls() {
     try {
       await invoke("capture_screenshot");
     } catch (e) {
-      if (String(e) !== "Screenshot cancelled") {
-        addToast(String(e), "error");
+      const msg = String(e);
+      if (msg === "Screenshot cancelled") {
+        // user pressed Esc / drew nothing — silent, expected.
+      } else if (msg.includes("permission denied")) {
+        addToast(
+          "Screen Recording permission needed — enable it in System Settings → Privacy & Security → Screen Recording, then relaunch.",
+          "error"
+        );
+      } else {
+        addToast(msg, "error");
       }
     }
   }
