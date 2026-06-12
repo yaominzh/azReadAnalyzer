@@ -18,11 +18,13 @@
 |------|----------------|
 | `tts_service/server.py` (modify) | add `POST /tts_stream` — async generator over `model.generate(stream=True)`, int16 LE PCM |
 | `tts_service/test_stream.py` (create) | contract test (status, media type, first-chunk latency, multi-chunk, even bytes) |
+| `tts_service/requirements.txt` (modify) | add `requests` (used by the contract test) |
 | `src-tauri/Cargo.toml` (modify) | reqwest `"stream"` feature + `futures-util` |
 | `src-tauri/src/commands.rs` (modify) | `AppState.tts_gen`; `play_tts_stream`, `stop_tts_stream` |
 | `src-tauri/src/lib.rs` (modify) | init `tts_gen`; register the two commands |
 | `src/lib/streamPlayer.ts` (create) | `int16ChunkToFloat32` + `createStreamPlayer` (Web Audio scheduler) |
 | `src/lib/streamPlayer.test.ts` (create) | unit tests for the PCM frame assembler |
+| `src/__mocks__/@tauri-apps/api/index.ts` + `src/test-setup.ts` (modify) | export a `Channel` stub + resolve `play_tts_stream`/`stop_tts_stream` so tests import cleanly |
 | `src/components/PlaybackControls.tsx` (modify) | Channel wiring, session guard, streaming play + `play_tts` fallback |
 
 ---
@@ -114,6 +116,15 @@ if __name__ == "__main__":
     main()
 ```
 
+- [ ] **Step 2b: Add the test dependency (review #5)** — append `requests` to `tts_service/requirements.txt` so a fresh sidecar venv can run the contract test:
+
+```
+mlx_audio
+fastapi
+uvicorn
+requests
+```
+
 - [ ] **Step 3: Run the contract test** (start the sidecar first if needed)
 
 ```bash
@@ -127,7 +138,7 @@ Expected: `OK: first chunk 0.1xs, N chunks, M bytes ...` (first chunk well under
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tts_service/server.py tts_service/test_stream.py
+git add tts_service/server.py tts_service/test_stream.py tts_service/requirements.txt
 git commit -m "feat(tts): /tts_stream endpoint streaming int16 PCM"
 ```
 
@@ -165,6 +176,16 @@ Add the field to the `AppState` struct (after `settings`):
 
 Add `use futures_util::StreamExt;` to the top imports. Then add the commands (e.g. after `play_tts`):
 ```rust
+/// Map a sidecar HTTP status + body to a result (review #1/#4 — never forward an
+/// error body as PCM). Extracted so the non-2xx branch is unit-testable.
+fn ensure_success(status: reqwest::StatusCode, body: &str) -> Result<(), String> {
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("TTS stream error: {body}"))
+    }
+}
+
 /// Streams TTS audio chunks (int16 PCM) from the sidecar to the frontend via a
 /// Tauri Channel. Status-checked (never forwards an error body as audio) and
 /// generation-gated (a newer stream or stop_tts_stream supersedes this one,
@@ -185,9 +206,10 @@ pub async fn play_tts_stream(
         .await
         .map_err(|_| "TTS service not running — start tts_service/".to_string())?;
 
-    if !resp.status().is_success() {
+    if let Err(e) = ensure_success(resp.status(), "") {
+        // read a short body for context, then fail — do NOT enter bytes_stream().
         let detail = resp.text().await.unwrap_or_default();
-        return Err(format!("TTS stream error: {detail}"));
+        return Err(if detail.is_empty() { e } else { format!("TTS stream error: {detail}") });
     }
 
     let mut stream = resp.bytes_stream();
@@ -224,17 +246,30 @@ In `generate_handler!`, add:
             commands::stop_tts_stream,
 ```
 
-- [ ] **Step 5: Add a Rust test** for the unreachable/non-2xx path — append to `src-tauri/src/commands.rs` (a new `#[cfg(test)]` module is not needed; add the test to an existing tests area or create one). Create this test module at the end of `commands.rs`:
+- [ ] **Step 5: Add Rust tests (review #4)** — append this `#[cfg(test)]` module at the end of `src-tauri/src/commands.rs`. It covers the two specified failure modes without needing a fake server: `ensure_success` returns `Err` on non-2xx (the "never forward an error body as PCM" guarantee), and a POST to a dead port errors before any send.
 ```rust
 #[cfg(test)]
-mod tests {
-    // play_tts_stream needs a Tauri Channel + State, which aren't constructible
-    // in a unit test; its unreachable/non-2xx behavior is exercised live (the
-    // sidecar-down fallback). This compile-only test guards the signatures.
+mod stream_tests {
+    use super::ensure_success;
+
     #[test]
-    fn commands_exist() {
-        let _ = super::stop_tts_stream;
-        let _ = super::play_tts_stream;
+    fn non_2xx_is_err() {
+        assert!(ensure_success(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom").is_err());
+        assert!(ensure_success(reqwest::StatusCode::NOT_FOUND, "").is_err());
+        assert!(ensure_success(reqwest::StatusCode::OK, "").is_ok());
+    }
+
+    #[tokio::test]
+    async fn stream_post_to_dead_port_errors() {
+        // Mirrors llm::returns_err_when_llm_unreachable: send() fails before any
+        // chunk is forwarded, so play_tts_stream returns Err → frontend falls back.
+        let client = reqwest::Client::new();
+        let r = client
+            .post("http://127.0.0.1:19998/tts_stream")
+            .json(&serde_json::json!({ "text": "x" }))
+            .send()
+            .await;
+        assert!(r.is_err());
     }
 }
 ```
@@ -345,15 +380,19 @@ export interface StreamPlayer {
   pause(): void;
   resume(): void;
   stop(): void;
-  /** seconds of audio scheduled so far (for progress) */
+  /** total audio seconds scheduled so far (duration label) */
   synthDuration(): number;
+  /** ctx time the first chunk starts (null until the first chunk), and the ctx
+   *  time the scheduled audio ends — the basis for progress/completion. */
+  playbackStartTime(): number | null;
+  playbackEndTime(): number;
 }
 
 export function createStreamPlayer(ctx: AudioContext, getSpeed: () => number): StreamPlayer {
   let remainder = new Uint8Array(0);
-  let nextStartTime = 0;
-  let started = false;
-  let scheduled = 0;
+  let nextStartTime = 0;          // ctx time the next chunk will start
+  let firstStartAt: number | null = null; // ctx time the first chunk starts
+  let scheduled = 0;              // total audio seconds scheduled
   const sources: AudioBufferSourceNode[] = [];
 
   function pushChunk(bytes: ArrayBuffer): void {
@@ -370,14 +409,12 @@ export function createStreamPlayer(ctx: AudioContext, getSpeed: () => number): S
     src.playbackRate.value = speed;
     src.connect(ctx.destination);
 
-    if (!started) {
-      nextStartTime = ctx.currentTime + LOOKAHEAD;
-      started = true;
-    }
+    if (firstStartAt === null) nextStartTime = ctx.currentTime + LOOKAHEAD;
     // Underrun clamp: a stall must not schedule into the past.
-    nextStartTime = Math.max(nextStartTime, ctx.currentTime + LOOKAHEAD);
-    src.start(nextStartTime);
-    nextStartTime += buffer.duration / speed;
+    const startAt = Math.max(nextStartTime, ctx.currentTime + LOOKAHEAD);
+    if (firstStartAt === null) firstStartAt = startAt;
+    src.start(startAt);
+    nextStartTime = startAt + buffer.duration / speed; // advance by actual played duration
     scheduled += buffer.duration;
     sources.push(src);
   }
@@ -392,13 +429,20 @@ export function createStreamPlayer(ctx: AudioContext, getSpeed: () => number): S
     }
     sources.length = 0;
     remainder = new Uint8Array(0);
-    started = false;
+    firstStartAt = null;
+    nextStartTime = 0;
     scheduled = 0;
   }
 
-  function synthDuration(): number { return scheduled; }
-
-  return { pushChunk, pause, resume, stop, synthDuration };
+  return {
+    pushChunk,
+    pause,
+    resume,
+    stop,
+    synthDuration: () => scheduled,
+    playbackStartTime: () => firstStartAt,
+    playbackEndTime: () => nextStartTime,
+  };
 }
 ```
 
@@ -419,11 +463,34 @@ git commit -m "feat(tts): streamPlayer — int16 frame assembler + Web Audio sch
 ## Task 4: `PlaybackControls` streaming integration + fallback
 
 **Files:**
+- Modify: `src/__mocks__/@tauri-apps/api/index.ts`, `src/test-setup.ts`
 - Modify: `src/components/PlaybackControls.tsx`
 
 This replaces the playback logic. Streaming is primary; the existing single-buffer Web Audio path becomes the fallback. A `playbackSessionId` ref guards against stale channel messages.
 
-- [ ] **Step 1: Replace `src/components/PlaybackControls.tsx`** with:
+- [ ] **Step 1: Update the Vitest mock (review #2)** — `PlaybackControls` now imports `Channel` from `@tauri-apps/api/core`, which the shared mock doesn't export. In `src/__mocks__/@tauri-apps/api/index.ts`, add a minimal `Channel` and handle the new commands in `invoke`:
+
+```ts
+export class Channel<T = unknown> {
+  onmessage: (msg: T) => void = () => {};
+  // Tauri serializes a Channel to an IPC id string; a stub is enough for tests.
+  toJSON() { return "__CHANNEL__"; }
+}
+```
+and inside the existing `invoke` mock body, before the final `return undefined;`, add:
+```ts
+  if (cmd === "play_tts_stream") return undefined; // resolves; no chunks in tests
+  if (cmd === "stop_tts_stream") return undefined;
+```
+Then in `src/test-setup.ts`, export `Channel` from the core mock:
+```ts
+vi.mock("@tauri-apps/api/core", async () => {
+  const m = await import("./__mocks__/@tauri-apps/api/index");
+  return { invoke: m.invoke, Channel: m.Channel };
+});
+```
+
+- [ ] **Step 2: Replace `src/components/PlaybackControls.tsx`** with:
 
 ```tsx
 import { useEffect, useRef, useState } from "react";
@@ -467,20 +534,26 @@ export default function PlaybackControls() {
     if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
   }
 
+  // Progress/completion are driven by the audio timeline (ctx-time bounds from
+  // the player), so they're correct under pause/resume (ctx.currentTime freezes
+  // on suspend) and any playback speed (end already accounts for per-chunk rate).
   function startProgress() {
     const ctx = ctxRef.current;
     const player = playerRef.current;
-    const startedAt = ctx ? ctx.currentTime : 0;
     function tick() {
       if (!ctx || !player) return;
       const synth = player.synthDuration();
-      const elapsed = Math.min(ctx.currentTime - startedAt, synth);
-      setCurrentTime(Math.max(0, elapsed));
+      const start = player.playbackStartTime();
+      const end = player.playbackEndTime();
       setDuration(synth);
-      setProgress(synth > 0 ? Math.max(0, elapsed) / synth : 0);
-      // Stream fully arrived AND all of it has played out → done.
-      if (streamDoneRef.current && synth > 0 && elapsed >= synth) {
-        stopProgress(); setProgress(1); setTtsState("idle"); return;
+      if (start != null && end > start) {
+        const p = Math.min(1, Math.max(0, (ctx.currentTime - start) / (end - start)));
+        setProgress(p);
+        setCurrentTime(p * synth);
+        // Stream fully arrived AND its scheduled audio has played out → done.
+        if (streamDoneRef.current && ctx.currentTime >= end - 0.02) {
+          stopProgress(); setProgress(1); setCurrentTime(synth); setTtsState("idle"); return;
+        }
       }
       rafRef.current = requestAnimationFrame(tick);
     }
@@ -650,17 +723,17 @@ export default function PlaybackControls() {
 }
 ```
 
-- [ ] **Step 2: Verify build + existing tests**
+- [ ] **Step 3: Verify build + existing tests**
 
 ```bash
 npx tsc -b && npx eslint . && npx vitest run
 ```
-Expected: clean; the existing `PlaybackControls.test.tsx` (renders Play + speed; disabled when empty) still passes (no `invoke`/`Channel` is hit on render). `streamPlayer` tests pass.
+Expected: clean; the existing `PlaybackControls.test.tsx` (renders Play + speed; disabled when empty) still passes (the mock now exports `Channel`; no command is invoked on render). `streamPlayer` tests pass.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/components/PlaybackControls.tsx
+git add src/__mocks__/@tauri-apps/api/index.ts src/test-setup.ts src/components/PlaybackControls.tsx
 git commit -m "feat(tts): streaming playback with session guard + play_tts fallback"
 ```
 
@@ -670,7 +743,8 @@ git commit -m "feat(tts): streaming playback with session guard + play_tts fallb
 
 - [ ] Start TTS (`/opt/homebrew/bin/uvicorn server:app --port 8123` from `tts_service/`), the app (`npx tauri dev`).
 - [ ] Paste a paragraph → Listen → **first sound in ~0.2–0.3 s** (vs ~3.5 s before); playback is gapless to the end.
-- [ ] Pause/resume works; speed change affects subsequent audio; progress bar grows as audio arrives.
+- [ ] Pause/resume works (progress freezes/continues correctly); progress bar reflects played position under pause and at non-1× speed; on completion the button returns to Play.
+- [ ] Speed: set **before Play** → immediate. A mid-play change applies only to not-yet-scheduled audio and may lag by the buffered lead (documented v1 behavior; bounded-horizon scheduler deferred).
 - [ ] Stop mid-stream then immediately replay → replay starts promptly (backend cancelled; sidecar freed).
 - [ ] Stop the TTS sidecar → Listen → falls back to `play_tts` (if also down, the "TTS service not running" toast).
 
@@ -681,3 +755,4 @@ git commit -m "feat(tts): streaming playback with session guard + play_tts fallb
 - **Spec coverage:** sidecar `/tts_stream` (Task 1); reqwest `stream`+`futures-util`, `play_tts_stream` status-check + gen-cancel, `stop_tts_stream`, `AppState.tts_gen` (Task 2); `streamPlayer` frame assembler + clamp + pause/resume/stop (Task 3); Channel wiring + session guard + speed contract + fallback + progress (Task 4). Review findings #1 (status check), #2 (session guard + tts_gen + stop_tts_stream), #3 (speed contract — `speedRef`, applies to new chunks), #4 (LOOKAHEAD clamp in pushChunk), #5 (contract test) all present.
 - **Types consistent:** `Channel<ArrayBuffer>` (JS) ↔ `Channel<InvokeResponseBody>` send `Raw(Vec<u8>)` → ArrayBuffer; `createStreamPlayer(ctx, getSpeed) -> StreamPlayer { pushChunk, pause, resume, stop, synthDuration }` used exactly in PlaybackControls; `play_tts_stream({ text, onChunk })` arg names match the Rust params (`text`, `on_chunk` → JS `onChunk`).
 - **Note:** Tauri maps the Rust param `on_chunk` to JS key `onChunk` (camelCase). The invoke uses `{ text, onChunk }`.
+- **Plan-review (Codex 2026-06-11) findings applied:** #1 progress/completion via ctx-time bounds (`playbackStartTime`/`playbackEndTime`) — correct under pause/resume + speed; #2 Vitest mock exports `Channel` + resolves the new commands; #3 speed contract documented honestly (set-before-Play; mid-play lag; horizon deferred); #4 `ensure_success` helper + real non-2xx / dead-port tests (not compile-only); #5 `requests` added to sidecar requirements.
