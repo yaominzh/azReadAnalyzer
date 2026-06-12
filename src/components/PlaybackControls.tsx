@@ -86,8 +86,10 @@ export default function PlaybackControls() {
 
   async function handlePlay() {
     if (ttsState === "playing") {
-      // pause: freeze the whole scheduled timeline.
-      ctxRef.current?.suspend().catch(() => {});
+      // pause: freeze the whole scheduled timeline. Await so ctx.state is
+      // settled to "suspended" before returning — makes the resume-gate on the
+      // next Play reliable (otherwise a fast Play may see "running" and re-synth).
+      await ctxRef.current?.suspend().catch(() => {});
       stopProgress();
       setTtsState("idle");
       return;
@@ -168,7 +170,7 @@ export default function PlaybackControls() {
         pushChunk() {},
         pause() { ctx.suspend(); },
         resume() { ctx.resume(); },
-        stop() { try { src.stop(); } catch { /* noop */ } src.disconnect(); },
+        stop() { try { src.stop(); } catch { /* noop */ } src.disconnect(); fbSourceRef.current = null; },
         synthDuration: () => buf.duration,
         playbackStartTime: () => startAt,
         playbackEndTime: () => startAt + buf.duration / speedRef.current,
