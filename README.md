@@ -36,6 +36,34 @@ React 19 / TS / Tailwind v4 / Zustand  ──Tauri IPC──►  Rust backend
               └─ tts_service  :8123 (Qwen3-TTS, streaming)
 ```
 
+```mermaid
+flowchart TD
+    UI["<b>Frontend</b> — React 19 / TS / Tailwind v4 / Zustand<br/>Capture · Playback · Recording · Feedback · Settings"]
+
+    subgraph RS["Rust backend · Tauri 2"]
+        direction TB
+        CB["clipboard (arboard)"]
+        AUD["audio recording (cpal / hound)"]
+        STT["Whisper STT (transcribe-rs)"]
+        DIFF["diff.rs — content diff"]
+        FLU["fluency.rs — pacing metrics"]
+    end
+
+    OCR["ocr_service :8124<br/>macOS Vision"]
+    TTS["tts_service :8123<br/>Qwen3-TTS (streaming)"]
+    LLM["Local LLM · OpenAI-compatible<br/>returns score + comments only"]
+
+    UI <-->|Tauri IPC| RS
+    RS -->|screenshot PNG| OCR -->|text| RS
+    RS -->|text| TTS -->|streamed PCM chunks| RS
+    AUD --> STT
+    STT --> DIFF
+    STT --> FLU
+    DIFF --> LLM
+    FLU --> LLM
+    LLM -->|score + comments| RS
+```
+
 A few design decisions are load-bearing — they're deliberate, not accidental:
 
 1. **Feedback is content + fluency, not phoneme-level pronunciation.** Whisper's language model auto-corrects dropped word-endings, so a transcript diff can't reliably detect mispronunciation. v1 focuses on what *can* be measured honestly; phoneme-level scoring is deferred.
