@@ -7,6 +7,9 @@ interface AppStore {
   // TTS
   ttsState: TtsState;
   ttsSpeed: number;
+  // Stop-TTS-playback callback registered by PlaybackControls; called by
+  // RecordingPanel before start_recording so the mic records only the user.
+  ttsStop: (() => void) | null;
   // Recording
   recordingState: RecordingState;
   audioLevel: number;
@@ -23,6 +26,7 @@ interface AppStore {
   setInputText(text: string): void;
   setTtsState(state: TtsState): void;
   setTtsSpeed(speed: number): void;
+  setTtsStop(fn: (() => void) | null): void;
   setRecordingState(state: RecordingState): void;
   setAudioLevel(level: number): void;
   setRecordingTimer(seconds: number): void;
@@ -38,6 +42,7 @@ const INITIAL_STATE = {
   inputText: "",
   ttsState: "idle" as TtsState,
   ttsSpeed: 1.0,
+  ttsStop: null as (() => void) | null,
   recordingState: "idle" as RecordingState,
   audioLevel: 0,
   recordingTimer: 0,
@@ -52,6 +57,7 @@ export const useAppStore = create<AppStore>()((set) => ({
   setInputText: (text) => set({ inputText: text }),
   setTtsState: (ttsState) => set({ ttsState }),
   setTtsSpeed: (ttsSpeed) => set({ ttsSpeed }),
+  setTtsStop: (ttsStop) => set({ ttsStop }),
   setRecordingState: (recordingState) => set({ recordingState }),
   setAudioLevel: (audioLevel) => set({ audioLevel }),
   setRecordingTimer: (recordingTimer) => set({ recordingTimer }),

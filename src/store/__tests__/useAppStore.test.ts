@@ -43,4 +43,12 @@ describe("useAppStore", () => {
     useAppStore.getState().clearCaptureImage();
     expect(useAppStore.getState().captureImageUrl).toBeNull();
   });
+
+  it("stores and clears the ttsStop callback", () => {
+    const fn = () => {};
+    useAppStore.getState().setTtsStop(fn);
+    expect(useAppStore.getState().ttsStop).toBe(fn);
+    useAppStore.getState().setTtsStop(null);
+    expect(useAppStore.getState().ttsStop).toBeNull();
+  });
 });
