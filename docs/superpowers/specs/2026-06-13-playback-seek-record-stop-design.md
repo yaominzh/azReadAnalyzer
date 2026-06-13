@@ -1,8 +1,9 @@
 # Playback Experience: Seek Handle + Stop-on-Record — Design Spec
 
 **Date:** 2026-06-13
-**Status:** Approved (brainstorming) — pending implementation plan
+**Status:** Approved (brainstorming), revised per third-party review — pending implementation plan
 **Branch:** `260612-iteration`
+**Review incorporated:** `docs/thirdpartyreview/2026-06-13-playback-seek-record-stop-design-review.md` (findings 1–4: pre-record stop ordering, `setSpeed` contract, fallback seek capability, ordering test).
 
 ## Context
 
@@ -40,30 +41,39 @@ Both are scoped tightly. This supersedes the earlier streaming-TTS spec's explic
    `(T − start)/(end − start) = ((T − startAt)·s + positionSec) / total = absolutePosition / total`. ✓
    So the existing PlaybackControls progress tick, time label, and completion check (`ctx.currentTime ≥ end − 0.02`) keep working at any speed and through pause/resume.
 
-4. **New surface for the UI:** `seek(positionSec)`, plus a way to know seek is allowed and the clip length. `synthDuration()` already returns total seconds once buffered. Add `isSeekable(): boolean` (true once the full clip is retained), or expose this via PlaybackControls' existing `streamDoneRef` — see UI section.
+4. **`setSpeed(speed: number): void`** (review finding 2). Speed must be a player method, because after a seek the active source is a single node owned by `streamPlayer` and unreachable from `PlaybackControls`. Behavior:
+   - **Single-source mode (post-seek, or fallback):** compute the current absolute position `pos` from the anchor and elapsed time, set the live source's `playbackRate.value = speed`, then recompute the virtual anchor as if re-seeking to `pos` at the new speed (`start = now − pos/speed`, `end = now + (total − pos)/speed`). This keeps progress continuous and correct after a mid-play speed change.
+   - **Chunk-streaming mode (before any seek):** update the stored speed used by `getSpeed()` for subsequently scheduled chunks; already-scheduled chunks keep their rate (the documented v1 "mid-play speed applies to upcoming audio" contract from the streaming-TTS spec — unchanged).
+
+5. **`isSeekable(): boolean`** (review finding 3). True once a complete clip is retained: for streaming, after the stream fully arrives; for the fallback player, immediately (it holds the full decoded WAV). `PlaybackControls` gates the drag handle on `player.isSeekable()` rather than on `streamDoneRef`, so the thumb is never enabled without a working `seek()`.
+
+6. **Unified `StreamPlayer` interface.** Both the streaming player and the fallback player object implement `seek`, `setSpeed`, and `isSeekable` (in addition to the existing methods). `synthDuration()` already returns total clip seconds once buffered.
 
 ### UI changes (`src/components/PlaybackControls.tsx`)
 
 - **Thumb.** Render a draggable thumb on the progress track at `progress * 100%`.
-- **Enabled state.** Draggable only when `streamDoneRef.current` is true (full clip buffered) and a player exists. During the initial ~2-3s stream-in, the thumb shows progress but does not respond to drag.
+- **Enabled state.** Draggable only when `player.isSeekable()` is true (full clip retained — streaming-done, or any fallback clip). During the initial ~2-3s stream-in the thumb shows progress but does not respond to drag.
 - **Interaction.** Pointer-based drag (`pointerdown` on track/thumb → capture; `pointermove` updates a local `scrubFraction` and renders the thumb at that position, pausing the rAF progress updates to avoid fighting the drag; `pointerup` → `player.seek(scrubFraction * synthDuration)` and resume the progress tick). A plain click on the track seeks to that point.
 - **Play/pause preserved.** If playback was playing, it continues from the new position; if paused (`ctx.state === "suspended"`), the source is repositioned but stays paused until Play/resume. After the clip finishes (idle, progress = 1), dragging back replays — the player is intact (completion does not tear it down).
-- **Speed.** Seeking uses the current speed for the anchor; a later speed change keeps the documented "applies to subsequently scheduled audio" contract (after a seek there is a single source, so a mid-play speed change behaves like the fallback single-source path).
+- **Speed.** `handleSpeedChange` calls `player.setSpeed(speed)` (in addition to updating the store). For a single seeked/fallback source this updates the live rate and recomputes the anchor (continuous progress); in chunk-streaming mode it applies to upcoming chunks per the existing contract. `handleSpeedChange` no longer pokes `fbSourceRef.playbackRate` directly — `setSpeed` owns it.
 
 ## Feature 2 — Stop playback when recording starts
 
-- **Reactive, one-directional wiring.** `PlaybackControls` subscribes to `recordingState`. A `useEffect` on `recordingState` stops playback when it becomes `"recording"`:
-  - `teardown()` (stop player, stop fallback source, bump session, stop progress),
-  - `invoke("stop_tts_stream")` to cancel any in-flight backend stream,
-  - `setTtsState("idle")`, reset `progress / currentTime / duration` to 0.
-- **`RecordingPanel` is unchanged.** It calls `start_recording` as today; the existing `recording-state` event updates the store, and PlaybackControls reacts. No direct coupling between the two components.
-- **Safety of `stop_tts_stream` here.** The earlier teardown deliberately omitted `stop_tts_stream` to avoid a stop-then-immediate-replay race. Record is not followed by a Play, so cancelling the backend stream here is safe and desirable (prevents any residual streamed audio).
-- **Result:** with TTS silenced before recording proceeds, the system-mic recording contains only the user's voice.
+**Ordering matters (review finding 1).** `start_recording` opens the cpal input stream *before* the backend emits the `recording-state` event, so a purely reactive `recordingState` effect would stop TTS only after the mic is already live — TTS could bleed into the first moments. The stop must happen **before** `invoke("start_recording")`.
+
+- **Primary path — pre-record stop via a store-registered callback.**
+  - `PlaybackControls` registers its stop function in the store on mount: a store slice `ttsStop: (() => void) | null` with `setTtsStop(fn)`. The registered function runs the local teardown synchronously — stop the player/fallback source (audible output ceases immediately, since Web Audio `source.stop()` is synchronous), bump the session, stop the progress tick, fire `invoke("stop_tts_stream")` (fire-and-forget) to cancel any in-flight backend stream, `setTtsState("idle")`, and reset `progress / currentTime / duration` to 0.
+  - `RecordingPanel.handleRecord` calls `useAppStore.getState().ttsStop?.()` **before** `await invoke("start_recording")`. Because the audible stop is synchronous, no TTS is playing once the mic opens. (The async `stop_tts_stream` only cancels the backend producer, which does not affect already-stopped local output.)
+- **Defensive fallback — keep the reactive effect.** `PlaybackControls` also keeps a `useEffect` on `recordingState` that stops playback when it becomes `"recording"`, so playback still stops if recording is ever initiated by another path. This is belt-and-suspenders, not the primary guarantee.
+- **`stop_tts_stream` is safe here.** The earlier teardown omitted it to avoid a stop-then-immediate-replay race; Record is not followed by a Play, so cancelling the backend stream is safe and desirable.
+- **Coupling.** `RecordingPanel` depends only on the store action, not on `PlaybackControls` — the components stay decoupled through the store.
+- **Result:** TTS is silenced before the mic captures, so the system-mic recording contains only the user's voice.
 
 ## Testing
 
 - **`streamPlayer` unit tests** (`src/lib/streamPlayer.test.ts`): extend with the seek anchor math as a pure function check (compute `start`/`end` for a given `positionSec`, `speed`, `total`, assert the progress formula yields `positionSec/total` at `T = startAt`). The actual audio scheduling requires a real `AudioContext` → manual/integration only.
-- **`PlaybackControls` test**: keep the existing render test (Play + speed render; disabled when empty). Add a test that flipping `recordingState` to `"recording"` stops playback — assert `invoke("stop_tts_stream")` is called and `ttsState` becomes `"idle"` (the shared Tauri mock already resolves `stop_tts_stream`).
+- **Ordering test (review finding 4):** add a `RecordingPanel` test that clicks Record and asserts the pre-record stop runs **before** `invoke("start_recording")` — e.g. register a spy as `ttsStop` in the store and assert the recorded call order is `ttsStop` → `invoke("start_recording")`. This is the test that actually proves the bleed fix.
+- **`PlaybackControls` tests**: keep the existing render test (Play + speed render; disabled when empty). Add a test that it registers `ttsStop` on mount, and that the defensive effect — flipping `recordingState` to `"recording"` — stops playback (`invoke("stop_tts_stream")` called, `ttsState` becomes `"idle"`; the shared Tauri mock already resolves `stop_tts_stream`).
 - **Manual (live):**
   1. Listen to a paragraph; after it finishes buffering, drag the thumb back to replay a phrase; drag mid-playback and confirm it continues from the new spot; drag while paused and confirm it stays paused at the new spot.
   2. Start Listen, then click Record mid-playback → playback stops instantly, the button returns to Play, and the resulting recording contains only your voice (no TTS bleed).
@@ -72,4 +82,5 @@ Both are scoped tightly. This supersedes the earlier streaming-TTS spec's explic
 
 - Seeking during the initial stream-in (before fully buffered).
 - Microphone input-device picker; echo/noise cancellation DSP.
-- Any change to the non-streaming `play_tts` fallback's behavior beyond what already exists (it already exposes the same ctx-time bounds, so seek can apply to it too if a fallback clip is buffered — implementation may reuse the same path).
+
+(Note: the `play_tts` fallback is **in scope** for seek — it implements the same seek-capable `StreamPlayer` interface since it already holds the full decoded buffer, per Feature 1 items 5–6. This is a resolved decision, not deferred work.)
