@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-13-playback-seek-record-stop-design.md` (review-incorporated).
 
+**Plan review incorporated:** `docs/thirdpartyreview/2026-06-13-playback-seek-record-stop-plan-review.md` — finding 1 (resume gate requires a live player + clear `playbackTextRef`), finding 2 (mid-stream failure tears down scheduled audio), finding 3 (`createBufferPlayer` unit test via a fake AudioContext; pointer UI documented manual-only), finding 4 (keyboard seek + `aria-disabled`/`tabIndex`).
+
 ---
 
 ## File structure
@@ -38,7 +40,61 @@
 Add to `src/lib/streamPlayer.test.ts` (keep the existing `int16ChunkToFloat32` describe block; add the import and this new block):
 
 ```ts
-import { int16ChunkToFloat32, computeSeekAnchor } from "./streamPlayer";
+import { int16ChunkToFloat32, computeSeekAnchor, createBufferPlayer } from "./streamPlayer";
+
+// Minimal fake Web Audio for createBufferPlayer (jsdom has no AudioContext).
+function fakeCtx(currentTime = 0) {
+  const ctx = {
+    currentTime,
+    destination: {},
+    _lastSource: null as unknown as { playbackRate: { value: number }; started: { when: number; offset?: number } | null },
+    createBufferSource() {
+      const node = {
+        buffer: null as unknown,
+        playbackRate: { value: 1 },
+        started: null as { when: number; offset?: number } | null,
+        connect() {},
+        disconnect() {},
+        start(when: number, offset?: number) { node.started = { when, offset }; },
+        stop() {},
+      };
+      ctx._lastSource = node;
+      return node;
+    },
+  };
+  return ctx;
+}
+const fakeBuffer = (duration: number) => ({ duration } as unknown as AudioBuffer);
+
+describe("createBufferPlayer", () => {
+  it("is seekable with the buffer's duration", () => {
+    const ctx = fakeCtx(10);
+    const p = createBufferPlayer(ctx as unknown as AudioContext, fakeBuffer(20), () => 1);
+    expect(p.isSeekable()).toBe(true);
+    expect(p.synthDuration()).toBe(20);
+  });
+
+  it("seek() starts the source at the requested offset and sets the anchor", () => {
+    const ctx = fakeCtx(10);
+    const p = createBufferPlayer(ctx as unknown as AudioContext, fakeBuffer(20), () => 1);
+    p.seek(5); // startAt = currentTime + 0.1 = 10.1
+    expect(ctx._lastSource.started?.offset).toBeCloseTo(5, 6);
+    expect(p.playbackStartTime()).toBeCloseTo(10.1 - 5, 6);        // start = startAt - pos/speed
+    expect(p.playbackEndTime()).toBeCloseTo(10.1 + (20 - 5), 6);   // end = startAt + (total - pos)/speed
+  });
+
+  it("setSpeed() updates the live rate and recomputes the anchor from current position", () => {
+    const ctx = fakeCtx(0);
+    const p = createBufferPlayer(ctx as unknown as AudioContext, fakeBuffer(10), () => 1);
+    p.seek(0);             // anchor: start 0.1, end 10.1
+    ctx.currentTime = 5;   // ~4.9s elapsed at 1x
+    p.setSpeed(2);
+    expect(ctx._lastSource.playbackRate.value).toBe(2);
+    // pos = (5-0.1)/(10.1-0.1)*10 = 4.9; new anchor: start = 5 - 4.9/2, end = 5 + (10-4.9)/2
+    expect(p.playbackStartTime()).toBeCloseTo(2.55, 6);
+    expect(p.playbackEndTime()).toBeCloseTo(7.55, 6);
+  });
+});
 
 describe("computeSeekAnchor", () => {
   it("maps the progress formula to position/total at T = startAt", () => {
@@ -65,7 +121,7 @@ describe("computeSeekAnchor", () => {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `npx vitest run src/lib/streamPlayer.test.ts`
-Expected: FAIL — `computeSeekAnchor` is not exported.
+Expected: FAIL — `computeSeekAnchor` / `createBufferPlayer` are not exported.
 
 - [ ] **Step 3: Rewrite `src/lib/streamPlayer.ts`**
 
@@ -292,7 +348,7 @@ export function createStreamPlayer(ctx: AudioContext, getSpeed: () => number): S
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npx vitest run src/lib/streamPlayer.test.ts`
-Expected: PASS — all `int16ChunkToFloat32` tests (3) and all `computeSeekAnchor` tests (3).
+Expected: PASS — `int16ChunkToFloat32` (3), `createBufferPlayer` (3), `computeSeekAnchor` (3).
 
 - [ ] **Step 5: Typecheck + lint**
 
@@ -531,6 +587,7 @@ export default function PlaybackControls() {
     setProgress(0); setCurrentTime(0); setDuration(0);
     setSeekable(false);
     streamDoneRef.current = false;
+    playbackTextRef.current = ""; // review #1: prevent a later Play resuming a torn-down clip
   }
 
   async function handlePlay() {
@@ -543,6 +600,7 @@ export default function PlaybackControls() {
     if (
       ctxRef.current &&
       ctxRef.current.state === "suspended" &&
+      playerRef.current &&                       // review #1: a torn-down player can't resume
       playbackTextRef.current === inputText
     ) {
       await ctxRef.current.resume();
@@ -585,8 +643,13 @@ export default function PlaybackControls() {
       if (!received) {
         await playFallback(session);
       } else {
-        stopProgress();
+        // Mid-stream failure after audio began: tear down the scheduled sources
+        // so audio doesn't keep playing while the UI shows idle (review #2).
+        teardown();
         setTtsState("idle");
+        setProgress(0); setCurrentTime(0); setDuration(0);
+        setSeekable(false);
+        streamDoneRef.current = false;
         addToast(String(e), "error");
       }
     }
@@ -668,6 +731,19 @@ export default function PlaybackControls() {
     seekTo(fractionFromClientX(e.clientX));
   }
 
+  // Keyboard seek (review #4): makes role="slider" genuinely operable.
+  function onSeekKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (!playerRef.current?.isSeekable()) return;
+    let f: number;
+    if (e.key === "ArrowLeft") f = Math.max(0, progress - 0.05);
+    else if (e.key === "ArrowRight") f = Math.min(1, progress + 0.05);
+    else if (e.key === "Home") f = 0;
+    else if (e.key === "End") f = 1;
+    else return;
+    e.preventDefault();
+    seekTo(f);
+  }
+
   // Register the stop-before-record callback (Feature 2, primary path).
   useEffect(() => {
     setTtsStop(stopPlayback);
@@ -723,12 +799,15 @@ export default function PlaybackControls() {
           onPointerDown={onScrubStart}
           onPointerMove={onScrubMove}
           onPointerUp={onScrubEnd}
+          onKeyDown={onSeekKeyDown}
           role="slider"
           aria-label="Seek"
           aria-valuemin={0}
           aria-valuemax={100}
           aria-valuenow={Math.round(progress * 100)}
-          className="relative flex-1 h-4 flex items-center"
+          aria-disabled={!seekable}
+          tabIndex={seekable ? 0 : -1}
+          className="relative flex-1 h-4 flex items-center outline-none"
           style={{ cursor: seekable ? "pointer" : "default", touchAction: "none" }}
         >
           <div className="absolute inset-x-0 h-[3px] bg-white/10 rounded-full overflow-hidden">
@@ -869,7 +948,7 @@ Expected: PASS — the existing four tests and the new ordering test.
 - [ ] **Step 5: Full suite + typecheck + lint**
 
 Run: `npx vitest run && npx tsc -b && npx eslint .`
-Expected: all clean. (Total frontend tests = previous count + `computeSeekAnchor` ×3 + store ×1 + PlaybackControls ×2 + RecordingPanel ×1.)
+Expected: all clean. (New tests vs. the previous suite: `computeSeekAnchor` ×3, `createBufferPlayer` ×3, store ×1, PlaybackControls ×2, RecordingPanel ×1.)
 
 - [ ] **Step 6: Commit**
 
@@ -885,7 +964,9 @@ git commit -m "feat(recording): stop TTS before start_recording (no mic bleed)"
 Run the sidecars + `npx tauri dev` (LLM env vars as before), then:
 
 - [ ] **Seek — after buffered.** Paste a paragraph → Listen. During the first ~2-3s the thumb is hidden/inert; once fully buffered the white thumb appears. Drag it back to replay a phrase; playback continues from the new spot. Drag forward; it jumps. Click directly on the track; it seeks there.
+- [ ] **Seek — keyboard.** Focus the seek track (Tab) once buffered; `ArrowLeft/Right` step the position, `Home/End` jump to the ends.
 - [ ] **Seek — while paused.** Pause mid-clip, drag the thumb; it repositions and stays paused; press Play; it resumes from the dragged position.
+- [ ] **Pause → Record → Play.** Pause mid-clip, click Record, then later click Play (same text): it must re-synthesize and actually play (not sit silently "playing") — verifies review #1.
 - [ ] **Seek — after finish.** Let the clip finish (button returns to Play), then drag back; it replays from there.
 - [ ] **Speed after seek.** Seek, then change speed mid-playback; audio rate changes and the progress bar stays continuous (no jump/drift). Repeat on the fallback path.
 - [ ] **Stop-on-record.** Start Listen, then click Record while audio is playing → playback stops instantly (button returns to Play, progress resets) and the resulting recording contains only your voice (no TTS bleed at the start).
@@ -898,4 +979,6 @@ Run the sidecars + `npx tauri dev` (LLM env vars as before), then:
 - **Spec coverage:** retain samples + `seek` + virtual anchor (Task 1: `createStreamPlayer` retains `allSamples`, `seek` delegates to `createBufferPlayer`, `computeSeekAnchor`); `setSpeed` with live-source update + anchor recompute (Task 1 `createBufferPlayer.setSpeed`, wired in Task 3 `handleSpeedChange`); `isSeekable` gating (Task 1 + Task 3 `seekable` state/thumb); fallback uses the same seek-capable interface (Task 3 `playFallback` → `createBufferPlayer`); pre-record stop via store callback + defensive effect (Task 2 slice, Task 3 register/effect, Task 4 `handleRecord`); ordering test (Task 4); thumb UI + drag + click-seek + play/pause preserved (Task 3). All spec sections map to a task.
 - **Type consistency:** `StreamPlayer` interface (Task 1) is implemented identically by `createStreamPlayer` and `createBufferPlayer`, and consumed in `PlaybackControls` (Task 3) — methods `seek/setSpeed/isSeekable/markComplete/pushChunk/pause/resume/stop/synthDuration/playbackStartTime/playbackEndTime` match across all three. Store `ttsStop: (() => void) | null` + `setTtsStop` (Task 2) match the `getState().ttsStop?.()` call (Task 4) and `setTtsStop(stopPlayback)` registration (Task 3).
 - **Removed:** `fbSourceRef` and the bespoke fallback player object (replaced by `createBufferPlayer`); `handleSpeedChange` no longer pokes a source ref directly. This also fixes the latent fallback speed-drift bug (review finding 2), since `playbackEndTime` is now the anchor, not a live division.
-- **Out of scope (per spec):** seeking during initial stream-in; mic device picker / DSP; keyboard seek (the `role="slider"` exposes `aria-valuenow` for screen readers but arrow-key seeking is not implemented).
+- **Accessibility (review #4):** the seek track is a keyboard-operable `role="slider"` — `ArrowLeft/Right` step ±5%, `Home/End` jump to ends, gated on `isSeekable()`. When not seekable it carries `aria-disabled` and `tabIndex={-1}`, and the pointer/key handlers no-op.
+- **Test coverage (review #3):** `createBufferPlayer.seek/setSpeed/isSeekable` are unit-tested via a fake AudioContext (Task 1). The `PlaybackControls` pointer-drag seek path is **verified manually only** — jsdom's `getBoundingClientRect` returns zeros, so a component drag test would be meaningless; the core seek math/wiring is covered by the player tests instead.
+- **Out of scope (per spec):** seeking during initial stream-in; mic device picker / DSP.
