@@ -21,6 +21,10 @@ export default function RecordingPanel() {
   }, [recordingState]);
 
   async function handleRecord() {
+    // Stop TTS BEFORE the mic opens so the recording captures only the user's
+    // voice (start_recording opens the cpal stream before emitting its event,
+    // so a reactive stop would be too late). The audible stop is synchronous.
+    useAppStore.getState().ttsStop?.();
     clearFeedback();
     setTimer(0);
     try {
