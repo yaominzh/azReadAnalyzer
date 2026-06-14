@@ -4,6 +4,7 @@ pub mod audio;
 pub mod stt;
 pub mod diff;
 pub mod fluency;
+pub mod markdown;
 pub mod llm;
 pub mod settings;
 mod commands;
