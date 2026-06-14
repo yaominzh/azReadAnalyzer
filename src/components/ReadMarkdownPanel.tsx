@@ -51,7 +51,9 @@ export default function ReadMarkdownPanel({ onClose }: { onClose: () => void }) 
       if (req !== reqRef.current || closedRef.current) return; // stale / closed
       setInputText(res.text);
       clearCaptureImage();
-      invoke("clear_session_media").catch(() => {}); // also clear Rust's last_capture_png (review #2)
+      if (!import.meta.env.VITE_USE_MOCK) {
+        invoke("clear_session_media").catch(() => {}); // also clear Rust's last_capture_png (review #2)
+      }
       clearFeedback();
       if (res.warnings.length > 0) addToast(summarize(res.warnings), "info");
       handleClose();
@@ -69,6 +71,7 @@ export default function ReadMarkdownPanel({ onClose }: { onClose: () => void }) 
         <p className="text-[11px] text-white/40 mb-3">One local file path per line. Add <span className="text-fuchsia-300">:10-50</span> for a line range (1-based, inclusive).</p>
         <textarea
           aria-label="Markdown file paths"
+          autoFocus
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder={PLACEHOLDER}
