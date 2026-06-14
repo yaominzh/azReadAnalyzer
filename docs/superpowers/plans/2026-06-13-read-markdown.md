@@ -117,12 +117,16 @@ Heading
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 3: Register the module so Rust compiles + discovers its tests**
+
+In `src-tauri/src/lib.rs`, add `pub mod markdown;` right after the `pub mod fluency;` line. **This must happen now** — without a `mod` declaration Rust never compiles `markdown.rs`, so `cargo test markdown::tests` would silently match **0 tests** instead of failing. (Command registration stays in Task 3.)
+
+- [ ] **Step 4: Run the test to verify it fails**
 
 Run: `cd src-tauri && cargo test markdown::tests -- --nocapture`
-Expected: FAIL (assertions fail — stub returns empty string).
+Expected: FAIL — **3 tests run and assertions fail** (the stub returns an empty string). If it reports "0 tests", the `pub mod markdown;` line is missing — go back to Step 3.
 
-- [ ] **Step 4: Implement `markdown_to_text`**
+- [ ] **Step 5: Implement `markdown_to_text`**
 
 Replace the stub body with:
 ```rust
@@ -174,15 +178,15 @@ pub fn markdown_to_text(md: &str) -> String {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cd src-tauri && cargo test markdown::tests -- --nocapture`
 Expected: PASS (3 tests). If `cargo` reports an unused-import warning for `Tag`/`TagEnd` not yet used by later tasks, that's fine — they're used here.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/markdown.rs
+git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/lib.rs src-tauri/src/markdown.rs
 git commit -m "feat(md): markdown_to_text faithful extraction via pulldown-cmark"
 ```
 
@@ -261,6 +265,51 @@ Add these to the `mod tests` block in `src-tauri/src/markdown.rs` (keep the Task
     fn empty_input_errors() {
         assert!(prepare_from_input("   \n  ").is_err());
     }
+
+    #[test]
+    fn resolve_path_expands_home_and_rejects_relative() {
+        assert!(resolve_path("/abs/x.md").is_ok());
+        assert!(resolve_path("relative/x.md").is_err());
+        let home = dirs::home_dir().unwrap();
+        let r = resolve_path("~/x.md").unwrap();
+        assert!(r.starts_with(&home) && r.ends_with("x.md"));
+    }
+
+    #[test]
+    fn directory_path_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        // only entry is a directory → skipped → empty → Err
+        assert!(prepare_from_input(&dir.path().display().to_string()).is_err());
+    }
+
+    #[test]
+    fn too_many_entries_warns_and_truncates() {
+        let files: Vec<_> = (0..=MAX_ENTRIES).map(|i| tmp_md(&format!("file{i}"))).collect(); // MAX_ENTRIES+1
+        let input = files.iter().map(|f| f.path().display().to_string()).collect::<Vec<_>>().join("\n");
+        let res = prepare_from_input(&input).unwrap();
+        assert!(res.warnings.iter().any(|w| w.contains("Too many")));
+        assert!(res.text.contains("file0"));
+        assert!(!res.text.contains(&format!("file{MAX_ENTRIES}"))); // the (MAX_ENTRIES+1)-th not read
+    }
+
+    #[test]
+    fn oversized_file_is_skipped() {
+        let big = tmp_md(&"x".repeat(MAX_FILE_BYTES as usize + 16));
+        // skipped (too large) before reading → empty → Err
+        assert!(prepare_from_input(&big.path().display().to_string()).is_err());
+    }
+
+    #[test]
+    fn output_truncated_at_max_total_chars() {
+        let f = tmp_md(&"a ".repeat(MAX_TOTAL_CHARS)); // ~2× the char cap
+        let res = prepare_from_input(&f.path().display().to_string()).unwrap();
+        assert!(res.text.chars().count() <= MAX_TOTAL_CHARS);
+        assert!(res.warnings.iter().any(|w| w.contains("truncated")));
+    }
+
+    // NOTE: the aggregate MAX_TOTAL_MD_BYTES stop is exercised in manual
+    // verification, not here — it needs >10 MiB across multiple ≤5 MiB files,
+    // which is too much I/O for the unit suite.
 ```
 
 > Note on `f2:3-4`: file is `# B`/blank/`beta`/`gamma`/`delta` → lines 3-4 are `beta` and `gamma`. The assertion accepts either word.
@@ -433,7 +482,7 @@ pub fn prepare_from_input(input: &str) -> Result<PrepareMarkdownResult, String> 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd src-tauri && cargo test markdown::tests -- --nocapture`
-Expected: PASS — Task 1 (3) + Task 2 (6) = 9 tests.
+Expected: PASS — Task 1 (3) + Task 2 (11) = 14 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -466,9 +515,9 @@ pub async fn prepare_markdown(
 }
 ```
 
-- [ ] **Step 2: Register the module + command in `src-tauri/src/lib.rs`**
+- [ ] **Step 2: Register the command in `src-tauri/src/lib.rs`**
 
-Add `pub mod markdown;` next to the other `pub mod` lines (e.g. after `pub mod fluency;`). Then add `commands::prepare_markdown,` to the `tauri::generate_handler![ ... ]` list (after `commands::stop_tts_stream,`).
+(`pub mod markdown;` was already added in Task 1.) Add `commands::prepare_markdown,` to the `tauri::generate_handler![ ... ]` list (after `commands::stop_tts_stream,`).
 
 - [ ] **Step 3: Verify it builds**
 
@@ -530,6 +579,7 @@ describe("ReadMarkdownPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /read/i }));
     await waitFor(() => expect(useAppStore.getState().inputText).toBe("hello world"));
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("prepare_markdown", { input: "/Users/a/x.md" });
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("clear_session_media"); // backend media cleared (review #2)
     expect(onClose).toHaveBeenCalled();
   });
 
@@ -620,11 +670,12 @@ export default function ReadMarkdownPanel({ onClose }: { onClose: () => void }) 
     setLoading(true);
     try {
       const res = import.meta.env.VITE_USE_MOCK
-        ? ({ text: input, warnings: [] } as PrepareMarkdownResult) // browser dev: echo input
+        ? ({ text: "Sample Markdown content for mock-mode UI development.", warnings: [] } as PrepareMarkdownResult)
         : await invoke<PrepareMarkdownResult>("prepare_markdown", { input });
       if (req !== reqRef.current || closedRef.current) return; // stale / closed
       setInputText(res.text);
       clearCaptureImage();
+      invoke("clear_session_media").catch(() => {}); // also clear Rust's last_capture_png (review #2)
       clearFeedback();
       if (res.warnings.length > 0) addToast(summarize(res.warnings), "info");
       handleClose();
@@ -731,7 +782,8 @@ git commit -m "feat(md): Read MD panel + capture-bar button"
 
 ## Self-review notes
 
-- **Spec coverage:** capture-bar button + modal textarea (Task 4); `path` / `path:start-end` parsing, 1-based inclusive slicing, `~/`+absolute resolution, robustness caps `MAX_ENTRIES`/`MAX_FILE_BYTES`/`MAX_TOTAL_MD_BYTES`/`MAX_TOTAL_CHARS` (Task 2); `pulldown-cmark` extraction with the exact event rules incl. dropped code/HTML/task-marker and tables/strikethrough enabled (Task 1); `spawn_blocking` command + registration + TS type (Task 3); request guard + clear thumbnail/feedback + single summary toast (Task 4). Error-handling table rows all map to warnings/`Err` in `prepare_from_input` (Task 2). Tests: Rust units are the backbone; frontend panel test incl. the request-guard case.
+- **Spec coverage:** capture-bar button + modal textarea (Task 4); `path` / `path:start-end` parsing, 1-based inclusive slicing, `~/`+absolute resolution, robustness caps `MAX_ENTRIES`/`MAX_FILE_BYTES`/`MAX_TOTAL_MD_BYTES`/`MAX_TOTAL_CHARS` (Task 2 — unit-tested for resolve/dir-skip/too-many/oversized/char-truncation; the 10 MiB aggregate stop is manual-verified, noted in Task 2); `pulldown-cmark` extraction with the exact event rules incl. dropped code/HTML/task-marker and tables/strikethrough enabled (Task 1); `spawn_blocking` command + registration + TS type (Task 3); request guard + clear thumbnail/feedback + `clear_session_media` (backend media) + single summary toast (Task 4). Error-handling table rows all map to warnings/`Err` in `prepare_from_input` (Task 2). Tests: Rust units are the backbone; frontend panel test incl. the request-guard case.
+- **Plan-review incorporated:** `docs/thirdpartyreview/2026-06-13-read-markdown-plan-review.md` — #1 `pub mod markdown;` moved into Task 1 (else early `cargo test` matches 0 tests); #2 `clear_session_media` on success; #3 mock-mode returns representative canned text (keeps the SettingsPanel-style `VITE_USE_MOCK` branch — unit tests already exercise `invoke`); #5 added cap/skip/resolve unit tests. (#4 left as the generic summary — the spec's count example was illustrative.)
 - **Type consistency:** `PrepareMarkdownResult { text, warnings }` is identical in `markdown.rs` (Rust, `#[derive(Serialize)]` → `text`/`warnings`, no rename needed), the command return type (Task 3), and `src/types/index.ts` (Task 4). `prepare_from_input(&str) -> Result<PrepareMarkdownResult, String>` is called by the command via `spawn_blocking`. `parse_specs`/`slice_lines` signatures match their tests.
 - **No LLM / no network** anywhere — `llm.rs` untouched; consistent with the deterministic decision.
 - **Out of scope (per spec):** remote URLs, any LLM, file-picker UI, file watching, escaping for paths ending in `:N-M`.
