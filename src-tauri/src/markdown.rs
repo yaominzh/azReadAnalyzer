@@ -182,6 +182,9 @@ pub fn prepare_from_input(input: &str) -> Result<PrepareMarkdownResult, String> 
                 continue;
             }
         };
+        // Charge the full file size to the aggregate budget even when a range is
+        // applied — we paid the I/O to read the whole file. (Conservative: a few
+        // range specs over large files can hit MAX_TOTAL_MD_BYTES before MAX_TOTAL_CHARS.)
         total_bytes += content.len();
 
         let piece = match spec.range {
@@ -209,7 +212,11 @@ pub fn prepare_from_input(input: &str) -> Result<PrepareMarkdownResult, String> 
         warnings.push("Text truncated to the maximum length".into());
     }
     if text.trim().is_empty() {
-        return Err("No readable Markdown content".into());
+        return Err(if warnings.is_empty() {
+            "No readable Markdown content".into()
+        } else {
+            format!("No readable Markdown content. {}", warnings.join("; "))
+        });
     }
     Ok(PrepareMarkdownResult { text, warnings })
 }
@@ -262,7 +269,7 @@ mod tests {
         let input = format!("{}\n{}:3-4", f1.path().display(), f2.path().display());
         let res = prepare_from_input(&input).unwrap();
         assert!(res.text.contains("alpha"));
-        assert!(res.text.contains("beta") || res.text.contains("gamma"));
+        assert!(res.text.contains("beta") && res.text.contains("gamma"));
         assert!(res.warnings.is_empty());
     }
 
