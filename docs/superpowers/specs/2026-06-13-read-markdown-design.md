@@ -1,127 +1,138 @@
 # Read from Markdown Files — Design Spec
 
 **Date:** 2026-06-13
-**Status:** Approved (brainstorming) — pending implementation plan
+**Status:** Approved (brainstorming), revised per third-party review — pending implementation plan
 **Branch:** `260613-read-md`
+**Review incorporated:** `docs/thirdpartyreview/2026-06-13-read-markdown-design-review.md` (see "Review resolutions").
 
 ## Context
 
-A third text-capture source alongside **Screenshot** (OCR) and **Paste** (clipboard): read text from one or more **local Markdown files**, optionally limited to a line range per file, and turn it into clean read-aloud text for the practice pipeline. The user enters file paths in a text window; the content is assembled in Rust and cleaned by the local LLM into TTS-ready prose, which lands in the practice input box exactly like the other two sources.
+A third text-capture source alongside **Screenshot** (OCR) and **Paste** (clipboard): read text from one or more **local Markdown files**, optionally limited to a line range per file, and turn it into clean read-aloud text for the practice pipeline. The user enters file paths in a text window; Rust assembles the content and extracts faithful plain text, which lands in the practice input box exactly like the other two sources.
 
-This is a reading-practice app: the captured text becomes what the user reads aloud and is scored against (the content diff). So the LLM cleanup is **faithful** — it strips Markdown formatting but preserves wording and meaning; it does not summarize or rephrase.
+This is a reading-practice app: the captured text becomes what the user reads aloud and is scored against (the content diff). The text must therefore stay **faithful to the source**.
 
-## Decisions (from brainstorming)
+## Decisions (brainstorming + review)
 
-- **Local files only** — no remote URLs. Keeps the app's 100%-on-device stance (the only egress remains the already-configured local LLM).
-- **LLM = faithful cleanup**, not summary. Preserve wording/meaning; strip Markdown.
-- **Fallback = deterministic Markdown-strip** when the LLM is unreachable/times out, with a toast — the feature still works offline.
+- **Local files only** — no remote URLs.
+- **Deterministic extraction, no LLM.** A real Markdown parser (`pulldown-cmark`) converts Markdown → plain prose. Faithful **by construction** (no summarizing/reordering risk), and **fully on-device** — this feature sends nothing over the network. (This supersedes the earlier "LLM cleanup" idea: the review showed prompt-only faithfulness is unenforceable for a scoring pipeline, and a parser removes the need.)
 - **Input UX:** a textarea, one entry per line.
+- **Robustness caps** on entries / file size / total text (not a security boundary — single-user app reading the user's own paths — but guards against OOM/UI-block and runaway TTS input).
 
 ## User flow
 
 1. A **Read MD** button in the capture bar (next to Paste) opens a modal panel (same portal pattern as `SettingsPanel`).
-2. The panel has a **textarea** + **Read** / **Cancel**. The user types **one entry per line**:
-   - `/Users/you/notes.md` — the whole file.
+2. The panel has a **textarea** + **Read** / **Cancel**. One **entry per line**:
+   - `/Users/you/notes.md` — whole file.
    - `/Users/you/ch1.md:10-50` — only lines 10–50 (**1-based, inclusive**).
-   - Blank lines are ignored.
-3. On **Read**, the frontend calls `invoke("prepare_markdown", { input })` with the raw textarea string, shows a loading state (the LLM call can take seconds), and on success calls `setInputText(result.text)`, closes the panel, and toasts any warnings. The user then proceeds to Listen / Record as usual.
+   - Blank lines ignored.
+3. On **Read**, the frontend calls `invoke("prepare_markdown", { input })`, shows a brief loading state, and on success calls `setInputText(result.text)`, **clears the capture thumbnail and any stale feedback**, closes the panel, and toasts any `warnings`. The user then proceeds to Listen / Record.
 
-## Architecture — Rust-owned read → clean → text
+## Architecture — Rust-owned, deterministic
 
-All file I/O, parsing, concatenation, the LLM call, and the fallback live in Rust (testable; consistent with the app's "deterministic logic in Rust, LLM best-effort" pattern). The frontend only sends the textarea text and consumes the result.
+All parsing, file I/O, slicing, concatenation, and Markdown→text extraction live in Rust (testable; consistent with the "deterministic logic in Rust" pattern). No `AppState`/LLM dependency — the command is self-contained.
 
 ### IPC contract
 
 ```rust
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PrepareMarkdownResult {
-    pub text: String,        // cleaned, read-aloud text (LLM output, or strip fallback)
-    pub used_llm: bool,      // false when the deterministic fallback was used
-    pub warnings: Vec<String>, // per-file problems (skipped file, clamped range, …)
+    pub text: String,          // faithful plain text, ready for TTS / scoring
+    pub warnings: Vec<String>, // per-entry problems (skipped file, clamped range, truncation, …)
 }
 
 #[tauri::command]
-pub async fn prepare_markdown(
-    input: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<PrepareMarkdownResult, String>;
+pub async fn prepare_markdown(input: String) -> Result<PrepareMarkdownResult, String>;
 ```
 
-TS side:
 ```ts
-interface PrepareMarkdownResult { text: string; usedLlm: boolean; warnings: string[]; }
+interface PrepareMarkdownResult { text: string; warnings: string[]; }
 ```
 
-### Pipeline (inside `prepare_markdown`)
+### Pipeline (inside `prepare_markdown`, new `markdown.rs`)
 
-1. **Parse** the input into entries (new `markdown.rs`). Each non-blank line → `FileSpec { path: String, range: Option<(usize, usize)> }`. A trailing `:<start>-<end>` (matched by a regex anchored at end-of-line, both integers) is the range; otherwise the whole line is the path. This tolerates `:` elsewhere in a path because only a trailing `:\d+-\d+` is treated as a range.
-2. **Read & slice** each file:
-   - Read as UTF-8. Unreadable/missing → push a warning, **skip** this entry.
-   - With a range: split into physical lines, take `start..=end` **1-based inclusive**; clamp `end` to the line count (warn if clamped); if `start > line_count` or `start > end` → warning, skip the entry.
+1. **Parse** `input` into entries. Each non-blank, trimmed line → `FileSpec { path, range: Option<(usize, usize)> }`. A trailing `:<start>-<end>` (both integers, matched by a regex anchored at end-of-line) is the range; otherwise the whole line is the path. Cap: at most **`MAX_ENTRIES = 25`** entries (extra → warning, ignored).
+2. **Read & slice** each entry, with robustness guards:
+   - `fs::metadata` → must be a **regular file** (reject directories / devices → warning, skip).
+   - Size guard: files larger than **`MAX_FILE_BYTES = 5 MiB`** → warning, skip.
+   - Read as UTF-8 (`read_to_string`); non-UTF-8/unreadable → warning, skip.
+   - With a range: split into physical lines, take `start..=end` **1-based inclusive**; clamp `end` to line count (warn if clamped); `start > line_count` or `start > end` → warning, skip the entry.
    - No range → whole file.
-3. **Concatenate** the kept slices in listed order, separated by a blank line (`\n\n`).
-4. If the concatenation is empty (no readable content) → return `Err("No readable Markdown content")` (frontend toasts, input unchanged).
-5. **LLM cleanup:** send the concatenated Markdown to the local LLM (reuse the OMLX client + `AppSettings` `LlmConfig` from `llm.rs`; honor the existing timeout) with the faithful-cleanup instruction (below). On success → `{ text: llm_out, used_llm: true, warnings }`.
-6. **Fallback:** if the LLM call fails for any reason (unreachable, non-2xx, timeout, empty response), run the deterministic strip on the concatenated Markdown → `{ text: stripped, used_llm: false, warnings: warnings + ["LLM unavailable — used basic Markdown cleanup"] }`.
+3. **Concatenate** kept slices in listed order, separated by `\n\n`.
+4. **Extract** plain text with `pulldown-cmark` (`markdown_to_text`, below).
+5. **Total cap:** if the extracted text exceeds **`MAX_TOTAL_CHARS = 100_000`**, truncate at a char boundary and add a warning.
+6. If the final text is empty (nothing readable) → `Err("No readable Markdown content")` (frontend toasts, input unchanged).
 
-### LLM cleanup instruction (faithful)
+The command is `async`; reads are bounded by the caps so they don't meaningfully block (the plan may use `spawn_blocking` if preferred).
 
-> You convert Markdown into clean text for read-aloud speaking practice. Preserve the original wording and meaning. Remove Markdown formatting: heading markers, emphasis (`*`/`_`), list bullets/numbers, inline-code backticks, and tables. Drop fenced code blocks entirely. For links, keep the link text and drop the URL. Do NOT summarize, shorten, translate, rephrase, or add any commentary. Output only the cleaned reading text.
+### `markdown_to_text(md: &str) -> String` (pulldown-cmark)
 
-Non-streaming, one-shot. Reuses the same endpoint/model/key/timeout the feedback step uses.
+Drive `pulldown_cmark::Parser` over events and emit faithful prose:
+- **`Text`** and **inline `Code`** → keep verbatim (inline code is usually a term/word — read it).
+- **Fenced/indented code blocks** (`CodeBlock` start→end) → **drop** the contained text (don't read code aloud).
+- **`SoftBreak`** → space; **`HardBreak`** → newline.
+- **End of `Paragraph` / `Heading` / `Item`** → newline (blank line after block elements).
+- **Links** → keep the link text (the `Text` events inside), drop the URL. **Images** → keep alt text if present, else drop.
+- **Tables** → keep cell text (cells separated by spaces/newlines) — readable, not structural.
+- Collapse 3+ consecutive blank lines to one; trim ends.
 
-### Deterministic strip (fallback, also unit-tested)
-
-A pure `strip_markdown(md: &str) -> String` in `markdown.rs`:
-- Drop fenced code blocks (```` ``` ````-delimited) entirely.
-- Remove ATX heading markers (`#`+), blockquote `>`, list markers (`-`, `*`, `+`, `1.`) at line start.
-- Strip emphasis (`*`/`_`/`~`) and inline-code backticks.
-- Links `[text](url)` → `text`; images `![alt](url)` → `alt` (or drop if no alt).
-- Collapse 3+ blank lines to one; trim.
-
-(The strip is intentionally simple — it's the offline safety net, not the primary path.)
+Using the parser (vs hand-rolled regex) correctly handles `~~~` fences, Setext headings, reference/autolinks, HTML blocks, escapes, and tables (review #7).
 
 ## Components / files
 
 - **Frontend:**
-  - `src/components/ReadMarkdownPanel.tsx` — modal (portal) with textarea, Read/Cancel, loading state. Calls `prepare_markdown`, `setInputText`, toasts warnings.
-  - `src/components/CaptureControls.tsx` — add the **Read MD** button that opens the panel.
-  - Panel open/close state: a local `useState` in `CaptureControls` (the panel is only opened from there), or a small store flag — implementer's choice; local state preferred (YAGNI).
+  - `src/components/ReadMarkdownPanel.tsx` — modal (portal): textarea, Read/Cancel, loading state, **a request guard** (a ref counter; a resolved `prepare_markdown` only applies if it's the latest request and the panel is still open — review #9).
+  - `src/components/CaptureControls.tsx` — **Read MD** button + local `useState` for panel open/close. On success: `setInputText`, `clearCaptureImage()`, `clearFeedback()` (review #6).
   - `src/types.ts` — `PrepareMarkdownResult`.
 - **Rust:**
-  - `src-tauri/src/markdown.rs` — `parse_specs`, `read_and_slice`, `strip_markdown` (+ a cleanup-call helper, or reuse one added to `llm.rs`).
+  - `src-tauri/src/markdown.rs` — `parse_specs`, `read_and_slice`, `markdown_to_text`, the caps as `const`s.
   - `src-tauri/src/commands.rs` — `prepare_markdown` command.
-  - `src-tauri/src/lib.rs` — register `prepare_markdown`; add `pub mod markdown;`.
-  - `src-tauri/src/llm.rs` — a reusable "prompt → text" call if one isn't already exposed.
+  - `src-tauri/src/lib.rs` — `pub mod markdown;` + register `prepare_markdown`.
+  - `src-tauri/Cargo.toml` — add `pulldown-cmark` (review #7; new dependency).
 
 ## Error handling
 
 | Case | Behavior |
 |------|----------|
-| File missing / unreadable / not UTF-8 | Warning, skip entry, continue |
+| Not a regular file (dir/device) | Warning, skip entry |
+| File > `MAX_FILE_BYTES` | Warning, skip entry |
+| Non-UTF-8 / unreadable | Warning, skip entry |
 | Range `start > end` or `start > line_count` | Warning, skip entry |
 | Range `end > line_count` | Clamp to line count, warning |
+| > `MAX_ENTRIES` lines | Warning; extra entries ignored |
+| Extracted text > `MAX_TOTAL_CHARS` | Truncate at char boundary, warning |
 | All entries fail / empty result | `Err` → toast, input unchanged |
-| LLM unreachable / timeout / non-2xx / empty | Deterministic strip + "LLM unavailable" warning; `usedLlm=false` |
-| Malformed line (no path) | Warning, skip |
+| Malformed line (empty path after trim) | Skipped (blank) |
 
-The frontend shows `warnings` as info/error toasts and, when `usedLlm === false`, makes clear basic cleanup was used.
+The frontend shows `warnings` as info toasts; an `Err` is an error toast and leaves the input unchanged.
+
+## Review resolutions (summary)
+
+- **#1 non-local LLM egress / #3 faithfulness / #4 llm.rs shape:** resolved by dropping the LLM — deterministic extraction is on-device and faithful by construction; no `llm.rs` change needed.
+- **#2 file-read boundaries:** reframed as robustness (regular-file check + size caps), not a security boundary (single-user app, user's own paths); no symlink/canonicalization ceremony.
+- **#5 size/context limits:** `MAX_ENTRIES`, `MAX_FILE_BYTES`, `MAX_TOTAL_CHARS` with warnings.
+- **#6 session side-effects:** Read MD clears the thumbnail (matches Paste) and stale feedback.
+- **#7 ad-hoc stripping:** use `pulldown-cmark`.
+- **#8 range ambiguity:** documented (below).
+- **#9 stale async result:** request guard in the panel.
+
+## Known limitation (review #8)
+
+A line whose path literally ends in `:<digits>-<digits>` is always parsed as `path:range`; such a path can't be addressed as a whole file. Acceptable on macOS (paths ending that way are vanishingly rare); no escaping syntax in v1.
 
 ## Testing
 
 - **Rust unit tests (`markdown.rs`)** — the backbone:
-  - `parse_specs`: path only; `path:10-50`; path containing `:` but no range; malformed range; blank lines skipped.
-  - `read_and_slice` (via temp files): whole file; 1-based inclusive slice; `end` clamp; `start` past EOF → skip; `start>end` → skip.
-  - concatenation order + `\n\n` separator.
-  - `strip_markdown`: headings, emphasis, inline code, fenced code dropped, links→text, images→alt, blockquote, list markers, blank-line collapse.
-- **LLM path** is integration/manual (the deterministic strip is the unit-tested fallback path).
-- **Frontend (`ReadMarkdownPanel`)** — Vitest + RTL with `prepare_markdown` mocked: renders textarea + buttons; on Read, calls `prepare_markdown` with the textarea text and sets `inputText` to the result; shows a warning toast when `warnings` is non-empty / `usedLlm` is false; Cancel closes without calling.
-- **Manual (live):** real `.md` files with and without ranges; multi-file concat order; LLM cleanup faithfulness; stop the LLM → confirm strip fallback + toast; bad path → warning + others still read.
+  - `parse_specs`: path only; `path:10-50`; path containing `:` but no trailing range; malformed range; blank lines; `> MAX_ENTRIES` truncation.
+  - `read_and_slice` (temp files): whole file; 1-based inclusive slice; `end` clamp; `start` past EOF → skip; `start>end` → skip; directory path → skip; oversized file → skip.
+  - concatenation order + `\n\n` separator; `MAX_TOTAL_CHARS` truncation.
+  - `markdown_to_text`: headings (ATX + Setext), emphasis, inline code kept, fenced **and** `~~~` code blocks dropped, links→text, reference links, autolinks, images→alt, tables→cell text, blank-line collapse.
+- **Frontend (`ReadMarkdownPanel`)** — Vitest + RTL with `prepare_markdown` mocked: renders textarea + buttons; Read calls `prepare_markdown` with the textarea text, sets `inputText`, clears thumbnail + feedback, toasts warnings; Cancel closes without calling; **request-guard test** — a resolve after close/reopen does not overwrite the input.
+- **Manual (live):** real `.md` files with/without ranges; multi-file concat order; code blocks dropped; links read as text; oversized file + too-many-entries warnings; bad path → warning while others still read.
 
 ## Out of scope
 
-- Remote/`http(s)` Markdown URLs (local files only).
-- Summarization / translation / any non-faithful rewriting by the LLM.
-- A rich multi-row file-picker UI (the textarea is the input; a future "Browse" helper could append paths but is not in this iteration).
+- Remote / `http(s)` Markdown URLs (local only).
+- Any LLM involvement / summarization / rewriting.
+- A rich multi-row file-picker UI (textarea is the input; a future "Browse" helper could append paths).
 - Watching files for changes / live re-read.
+- Escaping syntax for paths ending in `:N-M`.
