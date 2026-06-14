@@ -32,6 +32,7 @@
 **Files:**
 - Modify: `src-tauri/Cargo.toml`
 - Create: `src-tauri/src/markdown.rs`
+- Modify: `src-tauri/src/lib.rs` (declare `pub mod markdown;` — Step 3)
 - Test: in `src-tauri/src/markdown.rs` (`#[cfg(test)]`)
 
 - [ ] **Step 1: Add the dependency**
@@ -571,7 +572,12 @@ describe("ReadMarkdownPanel", () => {
     vi.mocked(invoke).mockReset();
   });
 
-  it("reads, sets input text, and closes", async () => {
+  it("reads, sets input text, clears stale thumbnail + feedback, and closes", async () => {
+    // seed stale session state to prove Read MD clears it
+    useAppStore.setState({
+      captureImageUrl: "blob:stale",
+      feedback: { score: 7, transcription: "x", diff: [], pacing: {} as never, comments: [] },
+    });
     vi.mocked(invoke).mockResolvedValue({ text: "hello world", warnings: [] });
     const onClose = vi.fn();
     render(<ReadMarkdownPanel onClose={onClose} />);
@@ -580,6 +586,8 @@ describe("ReadMarkdownPanel", () => {
     await waitFor(() => expect(useAppStore.getState().inputText).toBe("hello world"));
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("prepare_markdown", { input: "/Users/a/x.md" });
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("clear_session_media"); // backend media cleared (review #2)
+    expect(useAppStore.getState().captureImageUrl).toBeNull(); // thumbnail cleared
+    expect(useAppStore.getState().feedback).toBeNull();        // stale feedback cleared
     expect(onClose).toHaveBeenCalled();
   });
 
@@ -783,7 +791,8 @@ git commit -m "feat(md): Read MD panel + capture-bar button"
 ## Self-review notes
 
 - **Spec coverage:** capture-bar button + modal textarea (Task 4); `path` / `path:start-end` parsing, 1-based inclusive slicing, `~/`+absolute resolution, robustness caps `MAX_ENTRIES`/`MAX_FILE_BYTES`/`MAX_TOTAL_MD_BYTES`/`MAX_TOTAL_CHARS` (Task 2 — unit-tested for resolve/dir-skip/too-many/oversized/char-truncation; the 10 MiB aggregate stop is manual-verified, noted in Task 2); `pulldown-cmark` extraction with the exact event rules incl. dropped code/HTML/task-marker and tables/strikethrough enabled (Task 1); `spawn_blocking` command + registration + TS type (Task 3); request guard + clear thumbnail/feedback + `clear_session_media` (backend media) + single summary toast (Task 4). Error-handling table rows all map to warnings/`Err` in `prepare_from_input` (Task 2). Tests: Rust units are the backbone; frontend panel test incl. the request-guard case.
-- **Plan-review incorporated:** `docs/thirdpartyreview/2026-06-13-read-markdown-plan-review.md` — #1 `pub mod markdown;` moved into Task 1 (else early `cargo test` matches 0 tests); #2 `clear_session_media` on success; #3 mock-mode returns representative canned text (keeps the SettingsPanel-style `VITE_USE_MOCK` branch — unit tests already exercise `invoke`); #5 added cap/skip/resolve unit tests. (#4 left as the generic summary — the spec's count example was illustrative.)
+- **Plan-review incorporated (round 1):** `docs/thirdpartyreview/2026-06-13-read-markdown-plan-review.md` — #1 `pub mod markdown;` moved into Task 1 (else early `cargo test` matches 0 tests); #2 `clear_session_media` on success; #3 mock-mode returns representative canned text (keeps the SettingsPanel-style `VITE_USE_MOCK` branch — unit tests already exercise `invoke`); #5 added cap/skip/resolve unit tests. (#4 left as the generic summary — the spec's count example was illustrative.)
+- **Plan-review round 2:** Task 1 Files list now includes `lib.rs`; the success test asserts `captureImageUrl`/`feedback` are cleared. The repeated "add to shared mock + always invoke" suggestion was **rejected** — the shared `__mocks__` is wired only via `vi.mock` (vitest-only) and does not affect browser mock-mode; the in-component `VITE_USE_MOCK` branch is the required, established pattern (identical to SettingsPanel), and removing it would break `VITE_USE_MOCK=true` browser dev. The `MAX_TOTAL_MD_BYTES` injectable-caps refactor was declined as over-engineering for a `sum > cap` guard (kept manual-verified).
 - **Type consistency:** `PrepareMarkdownResult { text, warnings }` is identical in `markdown.rs` (Rust, `#[derive(Serialize)]` → `text`/`warnings`, no rename needed), the command return type (Task 3), and `src/types/index.ts` (Task 4). `prepare_from_input(&str) -> Result<PrepareMarkdownResult, String>` is called by the command via `spawn_blocking`. `parse_specs`/`slice_lines` signatures match their tests.
 - **No LLM / no network** anywhere — `llm.rs` untouched; consistent with the deterministic decision.
 - **Out of scope (per spec):** remote URLs, any LLM, file-picker UI, file watching, escaping for paths ending in `:N-M`.
