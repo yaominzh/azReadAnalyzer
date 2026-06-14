@@ -178,6 +178,18 @@ pub fn stop_tts_stream(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     Ok(())
 }
 
+/// Read local Markdown files (with optional line ranges) and return faithful
+/// plain text for the practice box. Deterministic + on-device; file reads run
+/// on a blocking thread so a large batch can't stall the command worker.
+#[command]
+pub async fn prepare_markdown(
+    input: String,
+) -> Result<crate::markdown::PrepareMarkdownResult, String> {
+    tokio::task::spawn_blocking(move || crate::markdown::prepare_from_input(&input))
+        .await
+        .map_err(|e| format!("read task failed: {e}"))?
+}
+
 /// Returns the last recording's WAV bytes for replay (#3), via the same
 /// raw-bytes `ipc::Response` pattern as `play_tts`. Err when nothing is stored.
 #[command]
