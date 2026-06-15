@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
@@ -56,5 +57,20 @@ describe("ReadMarkdownPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     expect(onClose).toHaveBeenCalled();
     expect(vi.mocked(invoke)).not.toHaveBeenCalled();
+  });
+
+  // Regression: under StrictMode (dev), effects run setup→cleanup→setup. If the
+  // unmount-cleanup's `closedRef=true` isn't reset on the re-mount, the post-await
+  // guard bails and the read silently no-ops (button stuck on "Reading…").
+  it("still applies the result under StrictMode (closedRef reset on mount)", async () => {
+    vi.mocked(invoke).mockResolvedValue({ text: "strict ok", warnings: [] });
+    render(
+      <StrictMode>
+        <ReadMarkdownPanel onClose={() => {}} />
+      </StrictMode>
+    );
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "/a.md" } });
+    fireEvent.click(screen.getByRole("button", { name: /read/i }));
+    await waitFor(() => expect(useAppStore.getState().inputText).toBe("strict ok"));
   });
 });

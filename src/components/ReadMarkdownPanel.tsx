@@ -26,11 +26,12 @@ export default function ReadMarkdownPanel({ onClose }: { onClose: () => void }) 
 
   // Esc to close.
   useEffect(() => {
+    closedRef.current = false; // (re)mount resets — survives React StrictMode's dev setup→cleanup→setup
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") handleClose(); };
     window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("keydown", onKey);
-      closedRef.current = true; // unmount invalidates any in-flight request (review #9)
+      closedRef.current = true; // real unmount invalidates any in-flight request (review #9)
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount/unmount only
   }, []);
