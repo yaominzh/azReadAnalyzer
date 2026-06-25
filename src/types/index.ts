@@ -87,3 +87,11 @@ export interface PrepareMarkdownResult {
   text: string;
   warnings: string[];
 }
+
+// Readiness of external dependencies, shown in the Settings "Services" panel
+export interface ServiceStatus {
+  tts: boolean;
+  ocr: boolean;
+  llm: boolean;
+  whisper: boolean;
+}
