@@ -37,6 +37,9 @@ image = "0.25"
 # Diff
 similar = "2"
 
+# Markdown → faithful plain text for the Read-MD capture source (deterministic).
+pulldown-cmark = "0.12"
+
 # STT
 transcribe-rs = { version = "0.3.11", features = ["whisper-cpp"] }
 

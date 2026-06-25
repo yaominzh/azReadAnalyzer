@@ -81,3 +81,9 @@ export interface AppSettings {
   llmApiKey: string;
   llmTimeoutSecs: number;
 }
+
+// Result of the prepare_markdown command (Read-from-Markdown capture source)
+export interface PrepareMarkdownResult {
+  text: string;
+  warnings: string[];
+}

@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/useAppStore";
 import { loadCaptureImage } from "../lib/loadCaptureImage";
+import ReadMarkdownPanel from "./ReadMarkdownPanel";
 import type { PasteResult } from "../types";
 
 export default function CaptureControls() {
@@ -8,6 +10,7 @@ export default function CaptureControls() {
   const setInputText = useAppStore((s) => s.setInputText);
   const clearFeedback = useAppStore((s) => s.clearFeedback);
   const clearCaptureImage = useAppStore((s) => s.clearCaptureImage);
+  const [readMdOpen, setReadMdOpen] = useState(false);
 
   async function handleScreenshot() {
     // capture_screenshot emits text-captured (with hasImage) → useTauriEvents
@@ -53,16 +56,14 @@ export default function CaptureControls() {
     "px-3 py-1.5 rounded-lg text-[12px] font-medium text-white/70 bg-white/[0.06] border border-white/10 hover:bg-white/[0.1] hover:text-white/90 transition-colors";
 
   return (
-    <div className="flex items-center gap-2 pt-3 border-t border-white/[0.06] flex-shrink-0">
-      <button className={btn} onClick={handleScreenshot}>
-        Screenshot
-      </button>
-      <button className={btn} onClick={handlePaste}>
-        Paste
-      </button>
-      <button className={`${btn} ml-auto`} onClick={handleClear}>
-        Clear
-      </button>
-    </div>
+    <>
+      <div className="flex items-center gap-2 pt-3 border-t border-white/[0.06] flex-shrink-0">
+        <button className={btn} onClick={handleScreenshot}>Screenshot</button>
+        <button className={btn} onClick={handlePaste}>Paste</button>
+        <button className={btn} onClick={() => setReadMdOpen(true)}>Read MD</button>
+        <button className={`${btn} ml-auto`} onClick={handleClear}>Clear</button>
+      </div>
+      {readMdOpen && <ReadMarkdownPanel onClose={() => setReadMdOpen(false)} />}
+    </>
   );
 }

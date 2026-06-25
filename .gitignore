@@ -11,3 +11,6 @@ tts_service/.venv/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Brainstorming visual-companion scratch
+.superpowers/
