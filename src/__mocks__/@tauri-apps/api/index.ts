@@ -18,6 +18,7 @@ export const invoke = vi.fn(async (cmd: string) => {
   if (cmd === "apply_settings") return undefined; // Ok(())
   if (cmd === "play_tts_stream") return undefined; // resolves; no chunks in tests
   if (cmd === "stop_tts_stream") return undefined;
+  if (cmd === "check_services") return { tts: true, ocr: true, llm: true, whisper: true };
   return undefined;
 });
 export const listen = vi.fn().mockResolvedValue(() => {});

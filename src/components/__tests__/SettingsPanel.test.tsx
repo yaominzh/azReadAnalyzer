@@ -40,6 +40,17 @@ describe("SettingsPanel", () => {
     );
   });
 
+  it("shows service readiness on open and re-checks on demand", async () => {
+    render(<SettingsPanel onClose={() => {}} />);
+    // Rows render; the auto-check resolves to all-ready (shared mock returns true).
+    expect(await screen.findByText("Whisper STT model")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByText("ready")).toHaveLength(4));
+    // Recheck re-invokes check_services.
+    vi.mocked(invoke).mockClear();
+    await userEvent.click(screen.getByRole("button", { name: /recheck/i }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("check_services"));
+  });
+
   it("does NOT apply a non-loopback URL until confirmed (review #1)", async () => {
     render(<SettingsPanel onClose={() => {}} />);
     const url = await screen.findByLabelText(/oMLX Base URL/i);

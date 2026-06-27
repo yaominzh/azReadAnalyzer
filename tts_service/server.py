@@ -25,6 +25,12 @@ class Req(BaseModel):
     text: str
 
 
+@app.get("/health")
+def health():
+    # The model loads synchronously at import, so a served /health means ready.
+    return {"status": "ok"}
+
+
 @app.post("/tts")
 async def tts(req: Req):
     # generate_audio uses MLX; MLX requires generation on the main thread

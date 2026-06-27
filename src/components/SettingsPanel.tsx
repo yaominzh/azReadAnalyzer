@@ -3,7 +3,16 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/useAppStore";
 import { FROST_PRESETS, FROST_DEFAULT, loadFrost, saveFrost, type Frost } from "../lib/frost";
-import type { AppSettings } from "../types";
+import type { AppSettings, ServiceStatus } from "../types";
+
+const ALL_READY: ServiceStatus = { tts: true, ocr: true, llm: true, whisper: true };
+
+const SERVICE_ROWS: Array<{ key: keyof ServiceStatus; label: string; hint: string }> = [
+  { key: "tts", label: "TTS (Qwen3-TTS)", hint: ":8123" },
+  { key: "ocr", label: "OCR (macOS Vision)", hint: ":8124" },
+  { key: "llm", label: "LLM (oMLX)", hint: "your endpoint" },
+  { key: "whisper", label: "Whisper STT model", hint: "on-device" },
+];
 
 function isLoopback(rawUrl: string): boolean {
   try {
@@ -26,6 +35,23 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [frost, setFrost] = useState<Frost>(() => loadFrost());
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [confirmedOffDevice, setConfirmedOffDevice] = useState(false);
+  const [services, setServices] = useState<ServiceStatus | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  // Probe external dependencies (TTS/OCR/LLM/Whisper). Mock mode has no backend.
+  async function runServiceCheck() {
+    setChecking(true);
+    try {
+      const s = import.meta.env.VITE_USE_MOCK
+        ? ALL_READY
+        : await invoke<ServiceStatus>("check_services");
+      setServices(s);
+    } catch {
+      setServices({ tts: false, ocr: false, llm: false, whisper: false });
+    } finally {
+      setChecking(false);
+    }
+  }
 
   // Load Rust-backed connection settings on open. Browser mock mode has no
   // Tauri backend (review #4) → use built-in defaults instead of invoke.
@@ -34,6 +60,8 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
       ? Promise.resolve(BUILTIN_SETTINGS)
       : invoke<AppSettings>("get_settings");
     p.then(setSettings).catch(() => {});
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- kick off the on-open service probe
+    runServiceCheck();
   }, []);
 
   // Esc to close.
@@ -133,6 +161,30 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             </label>
           </div>
         )}
+
+        {/* Services — readiness of the external dependencies */}
+        <div className="flex items-center justify-between mt-2 mb-2 border-t border-white/[0.06] pt-4">
+          <p className="text-[10px] font-semibold tracking-widest uppercase text-white/28">Services</p>
+          <button onClick={runServiceCheck} disabled={checking}
+            className="text-[11px] text-white/45 hover:text-white/70 disabled:opacity-40">
+            {checking ? "Checking…" : "Recheck"}
+          </button>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          {SERVICE_ROWS.map(({ key, label, hint }) => {
+            const state = checking || !services ? "checking" : services[key] ? "ready" : "down";
+            const dot = state === "ready" ? "bg-emerald-400" : state === "down" ? "bg-red-400" : "bg-white/25";
+            const text = state === "ready" ? "ready" : state === "down" ? "not reachable" : "checking…";
+            return (
+              <div key={key} className="flex items-center gap-2 text-[12px]" aria-label={`${label}: ${text}`}>
+                <span className={`w-2 h-2 rounded-full flex-shrink-0 ${dot}`} aria-hidden />
+                <span className="text-white/70">{label}</span>
+                <span className="text-white/30 text-[11px]">{hint}</span>
+                <span className="ml-auto text-[11px] text-white/40">{text}</span>
+              </div>
+            );
+          })}
+        </div>
 
         <div className="flex gap-2 mt-5">
           <button onClick={applyConnection} disabled={nonLocal && !confirmedOffDevice}

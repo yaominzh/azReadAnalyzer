@@ -50,6 +50,7 @@ pub fn run() {
             commands::play_tts_stream,
             commands::stop_tts_stream,
             commands::prepare_markdown,
+            commands::check_services,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use serde::Serialize;
 use tauri::{command, AppHandle, State};
 use futures_util::StreamExt;
 
@@ -330,6 +332,56 @@ pub fn apply_settings(
     let mut g = state.settings.lock().map_err(|e| e.to_string())?;
     *g = settings; // only update memory after a successful write
     Ok(())
+}
+
+/// Readiness of the app's external dependencies, surfaced in the Settings panel.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatus {
+    pub tts: bool,
+    pub ocr: bool,
+    pub llm: bool,
+    pub whisper: bool,
+}
+
+/// GET `url` (optionally bearer-authed) and report whether it answered 2xx.
+async fn ping_ok(client: &reqwest::Client, url: String, bearer: Option<String>) -> bool {
+    let mut req = client.get(&url);
+    if let Some(key) = bearer {
+        req = req.bearer_auth(key);
+    }
+    matches!(req.send().await, Ok(resp) if resp.status().is_success())
+}
+
+/// Probe the four dependencies for the Settings "Services" panel. The three
+/// HTTP checks run concurrently with a short timeout; Whisper is a local check
+/// (the engine is loaded at startup, so `Some` == ready).
+#[command]
+pub async fn check_services(state: State<'_, Arc<AppState>>) -> Result<ServiceStatus, String> {
+    let whisper = state.stt_engine.lock().map(|g| g.is_some()).unwrap_or(false);
+
+    // Snapshot the LLM endpoint (drop the lock before awaiting).
+    let (llm_url, llm_key) = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        (
+            format!("{}/models", s.llm_base_url.trim_end_matches('/')),
+            s.llm_api_key.clone(),
+        )
+    };
+    let bearer = if llm_key.is_empty() { None } else { Some(llm_key) };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let (tts, ocr, llm) = tokio::join!(
+        ping_ok(&client, "http://127.0.0.1:8123/health".into(), None),
+        ping_ok(&client, "http://127.0.0.1:8124/health".into(), None),
+        ping_ok(&client, llm_url, bearer),
+    );
+
+    Ok(ServiceStatus { tts, ocr, llm, whisper })
 }
 
 #[cfg(test)]
